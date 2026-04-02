@@ -43,12 +43,34 @@ async def close_client():
 # Backend health & selection
 # ==========================================================================
 
+def _auth_headers(backend: BackendConfig) -> dict:
+    """Return auth headers for a backend (empty dict for local backends)."""
+    if backend.api_key:
+        return {"Authorization": f"Bearer {backend.api_key}"}
+    return {}
+
+
+def _is_cloud(backend: BackendConfig) -> bool:
+    return backend.type == "cloud" or bool(backend.api_key)
+
+
+def _chat_url(backend: BackendConfig) -> str:
+    """Return the chat completions URL, accounting for cloud base URLs that already include /v1."""
+    if _is_cloud(backend):
+        return f"{backend.base_url}/chat/completions"
+    return f"{backend.base_url}/v1/chat/completions"
+
+
 async def check_backend_health(backend: BackendConfig) -> bool:
     client = get_client()
     try:
-        url = (f"{backend.base_url}/api/tags" if backend.type == "ollama"
-               else f"{backend.base_url}/v1/models")
-        resp = await client.get(url, timeout=3.0)
+        if backend.type == "ollama":
+            url = f"{backend.base_url}/api/tags"
+        elif _is_cloud(backend):
+            url = f"{backend.base_url}/models"
+        else:
+            url = f"{backend.base_url}/v1/models"
+        resp = await client.get(url, timeout=5.0, headers=_auth_headers(backend))
         healthy = resp.status_code == 200
         balancer.mark_healthy(backend.id, healthy)
         return healthy
@@ -83,12 +105,16 @@ async def get_available_backend() -> BackendConfig | None:
 
 async def fetch_backend_models(backend: BackendConfig) -> list[str]:
     client = get_client()
+    headers = _auth_headers(backend)
     try:
         if backend.type == "ollama":
-            resp = await client.get(f"{backend.base_url}/api/tags", timeout=5.0)
+            resp = await client.get(f"{backend.base_url}/api/tags", timeout=5.0, headers=headers)
             return [m["name"] for m in resp.json().get("models", [])]
+        elif _is_cloud(backend):
+            resp = await client.get(f"{backend.base_url}/models", timeout=5.0, headers=headers)
+            return [m["id"] for m in resp.json().get("data", [])]
         else:
-            resp = await client.get(f"{backend.base_url}/v1/models", timeout=5.0)
+            resp = await client.get(f"{backend.base_url}/v1/models", timeout=5.0, headers=headers)
             return [m["id"] for m in resp.json().get("data", [])]
     except Exception as e:
         log_manager.log("error", f"Failed to fetch models from '{backend.name}': {e}")
@@ -122,6 +148,23 @@ def _inject_no_think(messages: list[dict]) -> list[dict]:
 # ==========================================================================
 # Message format sanitization
 # ==========================================================================
+
+def _sanitize_messages_for_cloud(messages: list[dict]) -> list[dict]:
+    """Sanitize messages for cloud APIs (Moonshot Kimi, etc.).
+
+    Kimi requires reasoning_content on ALL assistant messages when thinking
+    is enabled on the model. Empty string is rejected for tool_call messages,
+    so we inject a placeholder.
+    """
+    out = []
+    for m in messages:
+        m = m.copy()
+        if m.get("role") == "assistant":
+            if "reasoning_content" not in m or not m["reasoning_content"]:
+                m["reasoning_content"] = "ok"
+        out.append(m)
+    return out
+
 
 def _sanitize_messages_for_ollama(messages: list[dict]) -> list[dict]:
     """Convert OpenAI-format messages to Ollama-compatible format.
@@ -436,8 +479,10 @@ def _prepare_request(backend: BackendConfig, body: dict, inject_no_think: bool, 
         if inject_no_think and is_reasoning:
             req["messages"] = _inject_no_think(req["messages"])
     else:
-        url = f"{backend.base_url}/v1/chat/completions"
+        url = _chat_url(backend)
         req = ollama_to_openai_request(body, backend.model, no_think=inject_no_think)
+        if _is_cloud(backend):
+            req["messages"] = _sanitize_messages_for_cloud(req["messages"])
     return url, req
 
 
@@ -465,10 +510,26 @@ async def stream_chat_ollama_out(backend: BackendConfig, body: dict):
     client = get_client()
 
     target_url, request_body = _prepare_request(backend, body, inject_no_think, is_reasoning)
+
+    # Debug: log message structure for cloud backends
+    if _is_cloud(backend):
+        msg_debug = []
+        for i, m in enumerate(request_body.get("messages", [])):
+            info = {"idx": i, "role": m.get("role")}
+            if m.get("tool_calls"):
+                info["tool_calls"] = len(m["tool_calls"])
+            if "reasoning_content" in m:
+                info["has_reasoning"] = True
+            if m.get("role") == "tool":
+                info["tool_call_id"] = m.get("tool_call_id", "?")
+            msg_debug.append(info)
+        log_manager.log("info", f"[cloud-debug-ollama-out] {len(msg_debug)} msgs", {"messages": msg_debug})
+
     log_manager.log("request", f"-> {backend.name} ({backend.type}) {target_url}",
                     {"backend": backend.name, "model": backend.model})
 
     async with client.stream("POST", target_url, json=request_body,
+                             headers=_auth_headers(backend),
                              timeout=httpx.Timeout(cfg.timeout, connect=5.0)) as response:
         ct = response.headers.get("content-type", "?")
         log_manager.log("info", f"[backend] HTTP {response.status_code} content-type={ct}")
@@ -559,15 +620,37 @@ async def stream_chat_openai_out(backend: BackendConfig, body: dict):
         target_url = f"{backend.base_url}/api/chat"
         request_body = openai_to_ollama_request(body, backend.model, no_think=inject_no_think)
     else:
-        target_url = f"{backend.base_url}/v1/chat/completions"
+        target_url = _chat_url(backend)
         request_body = {**body, "model": backend.model}
+        if _is_cloud(backend):
+            request_body["messages"] = _sanitize_messages_for_cloud(request_body.get("messages", []))
         if inject_no_think and is_reasoning:
             request_body["messages"] = _inject_no_think(request_body.get("messages", []))
+
+    # Debug: log message structure for cloud backends
+    if _is_cloud(backend):
+        msg_debug = []
+        for i, m in enumerate(request_body.get("messages", [])):
+            info = {"idx": i, "role": m.get("role"), "keys": list(m.keys())}
+            if m.get("tool_calls"):
+                info["tool_calls"] = len(m["tool_calls"])
+            if "reasoning_content" in m:
+                info["has_reasoning"] = True
+                info["reasoning_val"] = repr(m["reasoning_content"])[:50]
+            if m.get("role") == "tool":
+                info["tool_call_id"] = m.get("tool_call_id", "?")
+            msg_debug.append(info)
+        log_manager.log("info", f"[cloud-debug] sending {len(msg_debug)} messages", {"messages": msg_debug})
+        # Also log the raw JSON that will be sent for the problematic messages
+        for i, m in enumerate(request_body.get("messages", [])):
+            if m.get("role") == "assistant":
+                log_manager.log("info", f"[cloud-raw-msg-{i}] {json.dumps(m)[:300]}")
 
     log_manager.log("request", f"-> {backend.name} ({backend.type}) {target_url}",
                     {"backend": backend.name, "model": backend.model})
 
     async with client.stream("POST", target_url, json=request_body,
+                             headers=_auth_headers(backend),
                              timeout=httpx.Timeout(cfg.timeout, connect=5.0)) as response:
         if response.status_code != 200:
             error_body = await response.aread()
@@ -653,13 +736,14 @@ async def stream_generate_ollama_out(backend: BackendConfig, body: dict):
             if "/no_think" not in prompt:
                 request_body["prompt"] = prompt + " /no_think"
     else:
-        target_url = f"{backend.base_url}/v1/chat/completions"
+        target_url = _chat_url(backend)
         request_body = ollama_generate_to_openai_request(body, backend.model, no_think=inject_no_think)
 
     log_manager.log("request", f"-> {backend.name} /api/generate",
                     {"backend": backend.name, "model": backend.model})
 
     async with client.stream("POST", target_url, json=request_body,
+                             headers=_auth_headers(backend),
                              timeout=httpx.Timeout(cfg.timeout, connect=5.0)) as response:
         if response.status_code != 200:
             error_body = await response.aread()
@@ -721,9 +805,11 @@ async def _stream_and_buffer(backend: BackendConfig, body: dict) -> tuple[str, l
         if inject_no_think and is_reasoning:
             request_body["messages"] = _inject_no_think(request_body["messages"])
     else:
-        target_url = f"{backend.base_url}/v1/chat/completions"
+        target_url = _chat_url(backend)
         request_body = ollama_to_openai_request(body, backend.model, no_think=inject_no_think)
         request_body["stream"] = True
+        if _is_cloud(backend):
+            request_body["messages"] = _sanitize_messages_for_cloud(request_body["messages"])
 
     log_manager.log("request", f"-> {backend.name} (buffered-stream)", {"url": target_url})
 
@@ -732,6 +818,7 @@ async def _stream_and_buffer(backend: BackendConfig, body: dict) -> tuple[str, l
     tool_calls_by_index: dict[int, dict] = {}
 
     async with client.stream("POST", target_url, json=request_body,
+                             headers=_auth_headers(backend),
                              timeout=httpx.Timeout(cfg.timeout, connect=5.0)) as response:
         if response.status_code != 200:
             error_body = await response.aread()

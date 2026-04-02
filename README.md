@@ -2,7 +2,7 @@
 
 A local LLM proxy that exposes both **Ollama** and **OpenAI**-compatible APIs, routing requests to multiple backends with automatic fallback.
 
-Tested with **Ollama** and **LM Studio** running **Qwen3.5-9B**.
+Tested with **Ollama**, **LM Studio** (Qwen3.5-9B), and **Moonshot AI** (Kimi K2.5).
 
 ## Features
 
@@ -122,6 +122,7 @@ LLM Proxy (:11435)
   │  Backend #1   │  Ollama (localhost:11434) — qwen3:8b
   │  Backend #2   │  LM Studio (192.168.1.19:1234) — qwen/qwen3.5-9b
   │  Backend #3   │  llama.cpp (server2:8080) — model.gguf
+  │  Backend #4   │  Moonshot AI (api.moonshot.ai) — kimi-k2.5
   └───────────────┘
 ```
 
@@ -142,6 +143,27 @@ Or configure via the Web UI at `http://localhost:11435`.
 | `ollama` | 11434 | Ollama native API |
 | `lmstudio` | 1234 | OpenAI-compatible API |
 | `llamacpp` | 8080 | OpenAI-compatible API |
+| `cloud` | — | OpenAI-compatible with API key |
+
+### Cloud backends
+
+Cloud backends connect to remote APIs (Moonshot AI, OpenRouter, Together AI, Groq, etc.) using an API key. The Web UI includes provider presets with pre-filled URLs and model lists.
+
+**Moonshot AI (Kimi)** — tested with Kimi K2.5 (thinking disabled):
+
+```json
+{
+  "name": "Moonshot Kimi",
+  "type": "cloud",
+  "model": "kimi-k2.5",
+  "api_base": "https://api.moonshot.ai/v1",
+  "api_key": "sk-your-key"
+}
+```
+
+> Note: `api.moonshot.ai` (international) and `api.moonshot.cn` (China) use separate accounts and API keys.
+
+API keys are masked in the Web UI and API responses. The `config.json` file (which stores keys in plaintext) is excluded from git via `.gitignore`.
 
 ### Thinking suppression
 
