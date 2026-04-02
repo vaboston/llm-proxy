@@ -42,7 +42,52 @@ export OPENAI_API_BASE=http://localhost:11435/v1
 export OPENAI_API_KEY=not-needed
 ```
 
-### Example: curl
+### Hermes Agent
+
+The proxy acts as a drop-in Ollama replacement. In your Hermes config, point the Ollama provider to the proxy:
+
+```yaml
+# hermes config
+providers:
+  ollama:
+    base_url: http://<proxy-ip>:11435  # instead of http://localhost:11434
+    model: proxy-model
+```
+
+Or if Hermes uses the OpenAI provider:
+
+```yaml
+providers:
+  openai:
+    base_url: http://<proxy-ip>:11435/v1
+    api_key: not-needed
+    model: proxy-model
+```
+
+The model name must match the `proxy_model_name` in the proxy settings (default: `proxy-model`). The proxy translates it to the actual model configured on each backend.
+
+### Open WebUI
+
+In Open WebUI settings, add the proxy as an Ollama connection:
+
+```
+Settings > Connections > Ollama
+URL: http://<proxy-ip>:11435
+```
+
+The proxy will appear as an Ollama server with the model `proxy-model`. All tool calls, streaming, and multi-turn conversations work transparently.
+
+### OpenClaw / any OpenAI-compatible client
+
+Any client that supports the OpenAI API can use the proxy:
+
+```bash
+export OPENAI_API_BASE=http://<proxy-ip>:11435/v1
+export OPENAI_API_KEY=not-needed
+export OPENAI_MODEL=proxy-model
+```
+
+### curl
 
 ```bash
 # Ollama format
@@ -58,6 +103,26 @@ curl http://localhost:11435/v1/chat/completions -d '{
   "messages": [{"role": "user", "content": "Hello!"}],
   "stream": false
 }'
+```
+
+### How it works
+
+The client talks to the proxy using any model name (it's ignored — the proxy uses `proxy_model_name` for responses). The proxy picks a backend based on the load balancing strategy, translates the request format if needed (OpenAI <-> Ollama), and forwards to the actual backend model. The response is translated back and streamed to the client.
+
+```
+Client (Hermes, Open WebUI, curl...)
+  │
+  ▼
+LLM Proxy (:11435)
+  ├── /api/chat, /api/generate     (Ollama API)
+  └── /v1/chat/completions         (OpenAI API)
+        │
+        ▼  (format translation + thinking filter)
+  ┌─────┴─────────┐
+  │  Backend #1   │  Ollama (localhost:11434) — qwen3:8b
+  │  Backend #2   │  LM Studio (192.168.1.19:1234) — qwen/qwen3.5-9b
+  │  Backend #3   │  llama.cpp (server2:8080) — model.gguf
+  └───────────────┘
 ```
 
 ## Configuration
