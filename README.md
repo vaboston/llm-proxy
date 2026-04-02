@@ -122,6 +122,7 @@ LLM Proxy (:11435)
   │  Backend #1   │  Ollama (localhost:11434) — qwen3:8b
   │  Backend #2   │  LM Studio (192.168.1.19:1234) — qwen/qwen3.5-9b
   │  Backend #3   │  llama.cpp (server2:8080) — model.gguf
+  │  Backend #4   │  Moonshot AI (api.moonshot.ai) — kimi-k2.5
   └───────────────┘
 ```
 
