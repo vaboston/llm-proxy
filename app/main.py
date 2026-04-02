@@ -198,7 +198,11 @@ async def openai_models():
 
 @app.get("/config")
 async def get_full_config():
-    return get_config().model_dump()
+    data = get_config().model_dump()
+    for b in data.get("backends", []):
+        if b.get("api_key"):
+            b["api_key"] = "****" + b["api_key"][-4:]
+    return data
 
 
 @app.put("/config/settings")
@@ -215,7 +219,13 @@ async def update_settings(request: Request):
 
 @app.get("/config/backends")
 async def list_backends():
-    return [b.model_dump() for b in get_config().backends]
+    backends = []
+    for b in get_config().backends:
+        d = b.model_dump()
+        if d.get("api_key"):
+            d["api_key"] = "****" + d["api_key"][-4:]
+        backends.append(d)
+    return backends
 
 
 @app.post("/config/backends")
