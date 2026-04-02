@@ -12,15 +12,19 @@ CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 class BackendConfig(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
     name: str
-    type: str  # ollama | lmstudio | llamacpp
+    type: str  # ollama | lmstudio | llamacpp | cloud
     host: str = "127.0.0.1"
     port: int = 11434
     model: str = ""
     enabled: bool = True
     disable_thinking: bool = False
+    api_key: str = ""          # for cloud backends (Moonshot, OpenRouter, etc.)
+    api_base: str = ""         # custom base URL for cloud (e.g. https://api.moonshot.cn/v1)
 
     @property
     def base_url(self) -> str:
+        if self.api_base:
+            return self.api_base.rstrip("/")
         return f"http://{self.host}:{self.port}"
 
 

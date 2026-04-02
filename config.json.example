@@ -22,6 +22,16 @@
       "model": "qwen/qwen3.5-9b",
       "enabled": true,
       "disable_thinking": true
+    },
+    {
+      "id": "moonshot1",
+      "name": "Moonshot Kimi",
+      "type": "cloud",
+      "model": "kimi-k2-0711-preview",
+      "enabled": true,
+      "disable_thinking": false,
+      "api_base": "https://api.moonshot.ai/v1",
+      "api_key": "sk-your-moonshot-api-key"
     }
   ]
 }

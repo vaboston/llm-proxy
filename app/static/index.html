@@ -152,20 +152,44 @@
             <option value="ollama">Ollama</option>
             <option value="lmstudio">LM Studio</option>
             <option value="llamacpp">llama.cpp</option>
+            <option value="cloud">Cloud API (Moonshot, OpenRouter...)</option>
           </select>
         </div>
-        <div>
-          <label>Host</label>
-          <input id="add-host" placeholder="127.0.0.1" value="127.0.0.1">
+        <div id="add-local-fields">
+          <div>
+            <label>Host</label>
+            <input id="add-host" placeholder="127.0.0.1" value="127.0.0.1">
+          </div>
         </div>
-        <div>
+        <div id="add-local-port">
           <label>Port</label>
           <input id="add-port" type="number" placeholder="11434" value="11434">
+        </div>
+        <div class="full" id="add-cloud-fields" style="display:none">
+          <div style="margin-bottom:8px">
+            <label>Provider Preset</label>
+            <select id="add-cloud-preset" onchange="applyCloudPreset()">
+              <option value="">Custom</option>
+              <option value="moonshot">Moonshot AI (Kimi)</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="together">Together AI</option>
+              <option value="groq">Groq</option>
+            </select>
+          </div>
+          <div style="margin-bottom:8px">
+            <label>API Base URL</label>
+            <input id="add-api-base" placeholder="https://api.moonshot.cn/v1">
+          </div>
+          <div>
+            <label>API Key</label>
+            <input id="add-api-key" type="password" placeholder="sk-...">
+          </div>
         </div>
         <div class="full">
           <label>Model</label>
           <div class="model-select-row">
             <input id="add-model" placeholder="qwen3:8b">
+            <select id="add-model-preset" style="display:none; margin-right:8px" onchange="if(this.value) document.getElementById('add-model').value=this.value"></select>
             <button class="secondary small" onclick="fetchModelsForAdd()">Fetch</button>
           </div>
           <select id="add-model-select" style="display:none; margin-top:6px" onchange="document.getElementById('add-model').value=this.value"></select>
@@ -286,8 +310,9 @@ function renderBackends() {
         <span class="type">${esc(b.type)}</span>
       </div>
       <div class="details">
-        <div>Host: <span>${esc(b.host)}:${b.port}</span></div>
+        <div>${b.api_base ? 'URL' : 'Host'}: <span>${esc(b.api_base || (b.host + ':' + b.port))}</span></div>
         <div>Model: <span>${esc(b.model || '(none)')}</span></div>
+        ${b.api_key ? '<div>API Key: <span>****' + esc(b.api_key.slice(-4)) + '</span></div>' : ''}
         <div>Thinking: <span>${b.disable_thinking ? 'Disabled' : 'Enabled'}</span></div>
         <div>Status: <span>${b.enabled ? 'Enabled' : 'Disabled'}</span></div>
       </div>
@@ -307,14 +332,20 @@ function renderBackends() {
 }
 
 async function addBackend() {
+  const type = document.getElementById('add-type').value;
+  const isCloud = type === 'cloud';
   const body = {
     name: document.getElementById('add-name').value,
-    type: document.getElementById('add-type').value,
-    host: document.getElementById('add-host').value,
-    port: parseInt(document.getElementById('add-port').value),
+    type: type,
+    host: isCloud ? '0.0.0.0' : document.getElementById('add-host').value,
+    port: isCloud ? 0 : parseInt(document.getElementById('add-port').value),
     model: document.getElementById('add-model').value,
     disable_thinking: document.getElementById('add-disable-thinking').checked,
   };
+  if (isCloud) {
+    body.api_base = document.getElementById('add-api-base').value;
+    body.api_key = document.getElementById('add-api-key').value;
+  }
   if (!body.name) return;
   await fetch(API + '/config/backends', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
   document.getElementById('add-name').value = '';
@@ -544,10 +575,60 @@ async function abortAll() {
 loadConfig();
 initSSE();
 
-// Update default port when type changes
+// --- Cloud presets ---
+const CLOUD_PRESETS = {
+  moonshot: {
+    name: 'Moonshot Kimi',
+    api_base: 'https://api.moonshot.ai/v1',
+    models: ['kimi-k2.5', 'kimi-k2-0711-preview', 'kimi-k2-thinking', 'moonshot-v1-128k', 'moonshot-v1-32k', 'moonshot-v1-8k'],
+  },
+  openrouter: {
+    name: 'OpenRouter',
+    api_base: 'https://openrouter.ai/api/v1',
+    models: ['openai/gpt-4o', 'anthropic/claude-sonnet-4', 'google/gemini-2.5-pro', 'meta-llama/llama-4-maverick'],
+  },
+  together: {
+    name: 'Together AI',
+    api_base: 'https://api.together.xyz/v1',
+    models: ['meta-llama/Llama-3.3-70B-Instruct-Turbo', 'Qwen/Qwen3-235B-A22B', 'deepseek-ai/DeepSeek-R1'],
+  },
+  groq: {
+    name: 'Groq',
+    api_base: 'https://api.groq.com/openai/v1',
+    models: ['llama-3.3-70b-versatile', 'meta-llama/llama-4-scout-17b-16e-instruct', 'qwen-qwq-32b'],
+  },
+};
+
+function applyCloudPreset() {
+  const preset = CLOUD_PRESETS[document.getElementById('add-cloud-preset').value];
+  const modelPreset = document.getElementById('add-model-preset');
+  if (preset) {
+    document.getElementById('add-api-base').value = preset.api_base;
+    document.getElementById('add-name').value = document.getElementById('add-name').value || preset.name;
+    // Show model preset dropdown
+    modelPreset.innerHTML = '<option value="">Select a model...</option>' +
+      preset.models.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+    modelPreset.style.display = 'block';
+    if (preset.models.length) {
+      document.getElementById('add-model').value = preset.models[0];
+    }
+  } else {
+    document.getElementById('add-api-base').value = '';
+    modelPreset.style.display = 'none';
+  }
+}
+
+// Update fields when type changes
 document.getElementById('add-type').addEventListener('change', function() {
-  const ports = { ollama: 11434, lmstudio: 1234, llamacpp: 8080 };
-  document.getElementById('add-port').value = ports[this.value] || 8080;
+  const isCloud = this.value === 'cloud';
+  document.getElementById('add-local-fields').style.display = isCloud ? 'none' : '';
+  document.getElementById('add-local-port').style.display = isCloud ? 'none' : '';
+  document.getElementById('add-cloud-fields').style.display = isCloud ? '' : 'none';
+  document.getElementById('add-model-preset').style.display = 'none';
+  if (!isCloud) {
+    const ports = { ollama: 11434, lmstudio: 1234, llamacpp: 8080 };
+    document.getElementById('add-port').value = ports[this.value] || 8080;
+  }
 });
 </script>
 </body>
