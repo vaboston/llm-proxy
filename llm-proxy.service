@@ -1,0 +1,16 @@
+[Unit]
+Description=LLM Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=vabo
+WorkingDirectory=/home/vabo/Perso/proxy-llmv2
+ExecStartPre=/bin/bash -c 'test -d .venv || python3 -m venv .venv'
+ExecStartPre=/home/vabo/Perso/proxy-llmv2/.venv/bin/pip install -q -r /home/vabo/Perso/proxy-llmv2/requirements.txt
+ExecStart=/home/vabo/Perso/proxy-llmv2/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 11435 --log-level warning
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

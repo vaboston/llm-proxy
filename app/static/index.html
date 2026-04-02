@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Proxy</title>
+<style>
+  :root {
+    --bg: #0d1117; --bg2: #161b22; --bg3: #21262d; --bg4: #30363d;
+    --fg: #e6edf3; --fg2: #8b949e; --fg3: #484f58;
+    --accent: #58a6ff; --accent2: #3fb950; --red: #f85149; --orange: #d29922; --purple: #bc8cff;
+    --radius: 8px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--fg); height: 100vh; display: flex; flex-direction: column; }
+
+  /* Header */
+  header { background: var(--bg2); border-bottom: 1px solid var(--bg4); padding: 12px 24px; display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
+  header h1 { font-size: 18px; font-weight: 600; }
+  header .status { font-size: 12px; color: var(--fg2); margin-left: auto; }
+  header .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+  header .status .dot.on { background: var(--accent2); }
+  header .status .dot.off { background: var(--red); }
+
+  /* Tabs */
+  .tabs { display: flex; background: var(--bg2); border-bottom: 1px solid var(--bg4); padding: 0 24px; flex-shrink: 0; }
+  .tab { padding: 10px 20px; cursor: pointer; color: var(--fg2); border-bottom: 2px solid transparent; font-size: 14px; transition: all 0.15s; }
+  .tab:hover { color: var(--fg); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* Panels */
+  .panels { flex: 1; overflow: hidden; }
+  .panel { display: none; height: 100%; overflow-y: auto; padding: 24px; }
+  .panel.active { display: block; }
+
+  /* Forms & inputs */
+  label { display: block; font-size: 13px; color: var(--fg2); margin-bottom: 4px; }
+  input, select { background: var(--bg3); border: 1px solid var(--bg4); color: var(--fg); padding: 8px 12px; border-radius: var(--radius); font-size: 14px; width: 100%; }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+
+  button { background: var(--accent); color: #fff; border: none; padding: 8px 16px; border-radius: var(--radius); cursor: pointer; font-size: 13px; font-weight: 500; transition: opacity 0.15s; }
+  button:hover { opacity: 0.85; }
+  button.secondary { background: var(--bg3); color: var(--fg); }
+  button.danger { background: var(--red); }
+  button.small { padding: 4px 10px; font-size: 12px; }
+
+  /* Backend cards */
+  .backend-list { display: flex; flex-direction: column; gap: 12px; margin-bottom: 24px; }
+  .backend-card { background: var(--bg2); border: 1px solid var(--bg4); border-radius: var(--radius); padding: 16px; position: relative; }
+  .backend-card.disabled { opacity: 0.5; }
+  .backend-card .header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .backend-card .header .name { font-weight: 600; font-size: 15px; }
+  .backend-card .header .type { font-size: 11px; background: var(--bg4); padding: 2px 8px; border-radius: 4px; color: var(--fg2); text-transform: uppercase; }
+  .backend-card .header .health { width: 10px; height: 10px; border-radius: 50%; }
+  .backend-card .header .health.ok { background: var(--accent2); }
+  .backend-card .header .health.err { background: var(--red); }
+  .backend-card .header .health.unknown { background: var(--fg3); }
+  .backend-card .details { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 13px; color: var(--fg2); }
+  .backend-card .details span { font-family: monospace; color: var(--fg); }
+  .backend-card .actions { display: flex; gap: 8px; margin-top: 12px; }
+  .backend-card .priority { color: var(--fg3); font-size: 12px; font-weight: 600; min-width: 20px; }
+
+  /* Add backend form */
+  .add-form { background: var(--bg2); border: 1px solid var(--bg4); border-radius: var(--radius); padding: 20px; }
+  .add-form h3 { margin-bottom: 16px; font-size: 15px; }
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+  .form-grid .full { grid-column: 1 / -1; }
+
+  /* Settings panel */
+  .settings-section { background: var(--bg2); border: 1px solid var(--bg4); border-radius: var(--radius); padding: 20px; max-width: 600px; }
+  .settings-section h3 { margin-bottom: 16px; font-size: 15px; }
+  .setting-row { margin-bottom: 16px; }
+  .setting-row:last-child { margin-bottom: 0; }
+  .toggle { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+  .toggle input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--accent); }
+  .toggle span { font-size: 14px; }
+
+  /* Logs panel */
+  #logs-container { font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace; font-size: 12px; line-height: 1.6; }
+  .log-entry { padding: 6px 12px; border-radius: 4px; margin-bottom: 2px; cursor: pointer; display: flex; gap: 12px; }
+  .log-entry:hover { background: var(--bg3); }
+  .log-entry .time { color: var(--fg3); white-space: nowrap; flex-shrink: 0; }
+  .log-entry .badge { padding: 1px 6px; border-radius: 3px; font-size: 10px; text-transform: uppercase; font-weight: 600; flex-shrink: 0; min-width: 60px; text-align: center; }
+  .log-entry .badge.request { background: #1f3a5f; color: var(--accent); }
+  .log-entry .badge.response { background: #1a3a2a; color: var(--accent2); }
+  .log-entry .badge.error { background: #3d1f20; color: var(--red); }
+  .log-entry .badge.info { background: #2d2a1a; color: var(--orange); }
+  .log-entry .badge.thinking { background: #2a1f3d; color: var(--purple); }
+  .log-entry .msg { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log-entry .raw-data { display: none; white-space: pre-wrap; word-break: break-all; background: var(--bg); padding: 8px; border-radius: 4px; margin-top: 6px; color: var(--fg2); font-size: 11px; }
+  .conv-summary { margin-bottom: 8px; border-left: 2px solid var(--bg4); padding-left: 8px; }
+  .conv-line { padding: 2px 0; font-size: 12px; color: var(--fg); white-space: pre-wrap; word-break: break-word; }
+  .raw-json { margin-top: 6px; color: var(--fg3); font-size: 10px; }
+  .log-entry.expanded { flex-wrap: wrap; }
+  .log-entry.expanded .raw-data { display: block; width: 100%; }
+
+  .logs-toolbar { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; }
+  .logs-toolbar .count { color: var(--fg2); font-size: 12px; margin-left: auto; }
+
+  /* Stats panel */
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .stat-card { background: var(--bg2); border: 1px solid var(--bg4); border-radius: var(--radius); padding: 16px; }
+  .stat-card h4 { font-size: 12px; color: var(--fg2); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+  .stat-value { font-size: 28px; font-weight: 700; color: var(--fg); margin-bottom: 4px; }
+  .stat-sub { font-size: 12px; color: var(--fg3); }
+  .stat-bar-list { list-style: none; }
+  .stat-bar-list li { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 13px; }
+  .stat-bar-list .bar-label { min-width: 120px; color: var(--fg2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .stat-bar-list .bar-track { flex: 1; height: 6px; background: var(--bg4); border-radius: 3px; overflow: hidden; }
+  .stat-bar-list .bar-fill { height: 100%; background: var(--accent); border-radius: 3px; transition: width 0.3s; }
+  .stat-bar-list .bar-count { min-width: 40px; text-align: right; color: var(--fg); font-weight: 500; font-family: monospace; }
+
+  /* Model select dropdown in backend form */
+  .model-select-row { display: flex; gap: 8px; align-items: flex-end; }
+  .model-select-row input, .model-select-row select { flex: 1; }
+  .model-select-row button { flex-shrink: 0; margin-bottom: 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>LLM Proxy</h1>
+  <button class="danger small" id="abort-btn" onclick="abortAll()">Abort</button>
+  <div class="status">
+    <span class="dot on" id="status-dot"></span>
+    <span id="status-text">Running on :11435</span>
+  </div>
+</header>
+
+<div class="tabs">
+  <div class="tab active" data-panel="backends">Backends</div>
+  <div class="tab" data-panel="stats">Stats</div>
+  <div class="tab" data-panel="settings">Settings</div>
+  <div class="tab" data-panel="logs">Logs</div>
+</div>
+
+<div class="panels">
+  <!-- BACKENDS PANEL -->
+  <div class="panel active" id="panel-backends">
+    <div class="backend-list" id="backend-list"></div>
+
+    <div class="add-form">
+      <h3>Add Backend</h3>
+      <div class="form-grid">
+        <div>
+          <label>Name</label>
+          <input id="add-name" placeholder="my-ollama">
+        </div>
+        <div>
+          <label>Type</label>
+          <select id="add-type">
+            <option value="ollama">Ollama</option>
+            <option value="lmstudio">LM Studio</option>
+            <option value="llamacpp">llama.cpp</option>
+          </select>
+        </div>
+        <div>
+          <label>Host</label>
+          <input id="add-host" placeholder="127.0.0.1" value="127.0.0.1">
+        </div>
+        <div>
+          <label>Port</label>
+          <input id="add-port" type="number" placeholder="11434" value="11434">
+        </div>
+        <div class="full">
+          <label>Model</label>
+          <div class="model-select-row">
+            <input id="add-model" placeholder="qwen3:8b">
+            <button class="secondary small" onclick="fetchModelsForAdd()">Fetch</button>
+          </div>
+          <select id="add-model-select" style="display:none; margin-top:6px" onchange="document.getElementById('add-model').value=this.value"></select>
+        </div>
+        <div>
+          <label class="toggle">
+            <input type="checkbox" id="add-disable-thinking">
+            <span>Disable thinking</span>
+          </label>
+        </div>
+      </div>
+      <button onclick="addBackend()">Add Backend</button>
+    </div>
+  </div>
+
+  <!-- STATS PANEL -->
+  <div class="panel" id="panel-stats">
+    <div style="display:flex; gap:8px; margin-bottom:16px; align-items:center">
+      <button class="secondary small" onclick="loadStats()">Refresh</button>
+      <button class="danger small" onclick="resetStats()">Reset</button>
+      <span id="stats-uptime" style="color:var(--fg3); font-size:12px; margin-left:auto"></span>
+    </div>
+    <div class="stats-grid" id="stats-grid"></div>
+  </div>
+
+  <!-- SETTINGS PANEL -->
+  <div class="panel" id="panel-settings">
+    <div class="settings-section">
+      <h3>Global Settings</h3>
+      <div class="setting-row">
+        <label>Proxy Model Name</label>
+        <input id="set-model-name" placeholder="proxy-model">
+      </div>
+      <div class="setting-row">
+        <label>Timeout (seconds)</label>
+        <input id="set-timeout" type="number" value="120">
+      </div>
+      <div class="setting-row">
+        <label class="toggle">
+          <input type="checkbox" id="set-disable-thinking">
+          <span>Disable thinking globally</span>
+        </label>
+      </div>
+      <button onclick="saveSettings()">Save Settings</button>
+    </div>
+  </div>
+
+  <!-- LOGS PANEL -->
+  <div class="panel" id="panel-logs">
+    <div class="logs-toolbar">
+      <button class="secondary small" onclick="clearLogs()">Clear</button>
+      <button class="secondary small" onclick="copyLogs()">Copy</button>
+      <button class="secondary small" onclick="exportLogs()">Export</button>
+      <label class="toggle" style="margin-left:12px">
+        <input type="checkbox" id="logs-autoscroll" checked>
+        <span style="font-size:12px">Auto-scroll</span>
+      </label>
+      <div class="count"><span id="log-count">0</span> entries</div>
+    </div>
+    <div id="logs-container"></div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let config = { backends: [], proxy_model_name: 'proxy-model', timeout: 120, disable_thinking_global: false };
+let logEntries = [];
+let eventSource = null;
+
+// --- Tabs ---
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('panel-' + tab.dataset.panel).classList.add('active');
+    if (tab.dataset.panel === 'stats') loadStats();
+  });
+});
+
+// --- Config ---
+async function loadConfig() {
+  const res = await fetch(API + '/config');
+  config = await res.json();
+  renderBackends();
+  renderSettings();
+}
+
+function renderSettings() {
+  document.getElementById('set-model-name').value = config.proxy_model_name;
+  document.getElementById('set-timeout').value = config.timeout;
+  document.getElementById('set-disable-thinking').checked = config.disable_thinking_global;
+}
+
+async function saveSettings() {
+  const body = {
+    proxy_model_name: document.getElementById('set-model-name').value,
+    timeout: parseInt(document.getElementById('set-timeout').value),
+    disable_thinking_global: document.getElementById('set-disable-thinking').checked,
+  };
+  await fetch(API + '/config/settings', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  await loadConfig();
+}
+
+// --- Backends ---
+function renderBackends() {
+  const list = document.getElementById('backend-list');
+  list.innerHTML = '';
+  config.backends.forEach((b, idx) => {
+    const card = document.createElement('div');
+    card.className = 'backend-card' + (b.enabled ? '' : ' disabled');
+    card.dataset.id = b.id;
+    card.innerHTML = `
+      <div class="header">
+        <span class="priority">#${idx + 1}</span>
+        <span class="health unknown" id="health-${b.id}"></span>
+        <span class="name">${esc(b.name)}</span>
+        <span class="type">${esc(b.type)}</span>
+      </div>
+      <div class="details">
+        <div>Host: <span>${esc(b.host)}:${b.port}</span></div>
+        <div>Model: <span>${esc(b.model || '(none)')}</span></div>
+        <div>Thinking: <span>${b.disable_thinking ? 'Disabled' : 'Enabled'}</span></div>
+        <div>Status: <span>${b.enabled ? 'Enabled' : 'Disabled'}</span></div>
+      </div>
+      <div class="actions">
+        <button class="small secondary" onclick="moveBackend('${b.id}', -1)" ${idx === 0 ? 'disabled' : ''} title="Move up">▲</button>
+        <button class="small secondary" onclick="moveBackend('${b.id}', 1)" ${idx === config.backends.length - 1 ? 'disabled' : ''} title="Move down">▼</button>
+        <button class="small secondary" onclick="checkHealth('${b.id}')">Check</button>
+        <button class="small secondary" onclick="toggleBackend('${b.id}', ${!b.enabled})">${b.enabled ? 'Disable' : 'Enable'}</button>
+        <button class="small secondary" onclick="fetchModels('${b.id}')">Fetch Models</button>
+        <button class="small danger" onclick="deleteBackend('${b.id}')">Delete</button>
+      </div>
+    `;
+    list.appendChild(card);
+    // Auto-check health
+    checkHealth(b.id);
+  });
+}
+
+async function addBackend() {
+  const body = {
+    name: document.getElementById('add-name').value,
+    type: document.getElementById('add-type').value,
+    host: document.getElementById('add-host').value,
+    port: parseInt(document.getElementById('add-port').value),
+    model: document.getElementById('add-model').value,
+    disable_thinking: document.getElementById('add-disable-thinking').checked,
+  };
+  if (!body.name) return;
+  await fetch(API + '/config/backends', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  document.getElementById('add-name').value = '';
+  document.getElementById('add-model').value = '';
+  document.getElementById('add-model-select').style.display = 'none';
+  await loadConfig();
+}
+
+async function moveBackend(id, direction) {
+  const ids = config.backends.map(x => x.id);
+  const idx = ids.indexOf(id);
+  const newIdx = idx + direction;
+  if (newIdx < 0 || newIdx >= ids.length) return;
+  ids.splice(idx, 1);
+  ids.splice(newIdx, 0, id);
+  await fetch(API + '/config/backends/reorder', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ids}) });
+  await loadConfig();
+}
+
+async function deleteBackend(id) {
+  if (!confirm('Delete this backend?')) return;
+  await fetch(API + '/config/backends/' + id, { method: 'DELETE' });
+  await loadConfig();
+}
+
+async function toggleBackend(id, enabled) {
+  await fetch(API + '/config/backends/' + id, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({enabled}) });
+  await loadConfig();
+}
+
+async function checkHealth(id) {
+  const dot = document.getElementById('health-' + id);
+  if (!dot) return;
+  dot.className = 'health unknown';
+  try {
+    const res = await fetch(API + '/config/backends/' + id + '/health');
+    const data = await res.json();
+    dot.className = 'health ' + (data.healthy ? 'ok' : 'err');
+  } catch { dot.className = 'health err'; }
+}
+
+async function fetchModels(id) {
+  try {
+    const res = await fetch(API + '/config/backends/' + id + '/models');
+    const data = await res.json();
+    const models = data.models || [];
+    if (!models.length) { alert('No models found'); return; }
+    const model = prompt('Available models:\n' + models.join('\n') + '\n\nEnter model name to set:');
+    if (model) {
+      await fetch(API + '/config/backends/' + id, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({model}) });
+      await loadConfig();
+    }
+  } catch (e) { alert('Failed to fetch models: ' + e.message); }
+}
+
+async function fetchModelsForAdd() {
+  const type = document.getElementById('add-type').value;
+  const host = document.getElementById('add-host').value;
+  const port = document.getElementById('add-port').value;
+  const sel = document.getElementById('add-model-select');
+  try {
+    const res = await fetch(API + '/config/backends/probe-models', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ type, host, port: parseInt(port) })
+    });
+    const data = await res.json();
+    const models = data.models || [];
+    if (!models.length) { alert('No models found'); return; }
+    sel.innerHTML = '<option value="">Select a model...</option>' + models.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+    sel.style.display = 'block';
+  } catch (e) { alert('Failed to fetch: ' + e.message); }
+}
+
+// --- Logs ---
+function initSSE() {
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource(API + '/logs/stream');
+  eventSource.onmessage = (e) => {
+    try {
+      const entry = JSON.parse(e.data);
+      logEntries.push(entry);
+      appendLogEntry(entry);
+    } catch {}
+  };
+  eventSource.onerror = () => {
+    setTimeout(initSSE, 3000);
+  };
+  // Load recent
+  fetch(API + '/logs/recent').then(r => r.json()).then(entries => {
+    entries.forEach(e => { logEntries.push(e); appendLogEntry(e); });
+  });
+}
+
+function renderConversation(raw) {
+  // Render conversation summary lines from raw_data
+  const conv = raw.conversation;
+  if (!conv || !conv.length) return '';
+  return '<div class="conv-summary">' +
+    conv.map(line => `<div class="conv-line">${esc(line)}</div>`).join('') +
+    '</div>';
+}
+
+function renderRawData(raw) {
+  // Render raw_data excluding conversation (shown separately)
+  const filtered = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (k !== 'conversation') filtered[k] = v;
+  }
+  if (!Object.keys(filtered).length) return '';
+  return `<div class="raw-json">${esc(JSON.stringify(filtered, null, 2))}</div>`;
+}
+
+function appendLogEntry(entry) {
+  const container = document.getElementById('logs-container');
+  const div = document.createElement('div');
+  div.className = 'log-entry';
+  const ts = new Date(entry.timestamp * 1000);
+  const time = ts.toLocaleTimeString();
+  const raw = entry.raw_data || {};
+  const hasConv = raw.conversation && raw.conversation.length > 0;
+  const hasRaw = Object.keys(raw).length > 0;
+  div.innerHTML = `
+    <span class="time">${time}</span>
+    <span class="badge ${entry.event_type}">${entry.event_type}</span>
+    <span class="msg">${esc(entry.summary)}</span>
+    ${hasConv || hasRaw ? `<div class="raw-data">${hasConv ? renderConversation(raw) : ''}${renderRawData(raw)}</div>` : ''}
+  `;
+  if (hasConv || hasRaw) {
+    div.addEventListener('click', () => div.classList.toggle('expanded'));
+  }
+  container.appendChild(div);
+  document.getElementById('log-count').textContent = logEntries.length;
+  if (document.getElementById('logs-autoscroll').checked) {
+    container.parentElement.scrollTop = container.parentElement.scrollHeight;
+  }
+}
+
+function clearLogs() {
+  logEntries = [];
+  document.getElementById('logs-container').innerHTML = '';
+  document.getElementById('log-count').textContent = '0';
+}
+
+function copyLogs() {
+  const text = logEntries.map(e => {
+    const ts = new Date(e.timestamp * 1000).toISOString();
+    return `[${ts}] [${e.event_type}] ${e.summary}`;
+  }).join('\n');
+  navigator.clipboard.writeText(text);
+}
+
+function exportLogs() {
+  const blob = new Blob([JSON.stringify(logEntries, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = 'proxy-logs.json'; a.click();
+  URL.revokeObjectURL(url);
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+
+// --- Stats ---
+async function loadStats() {
+  const res = await fetch(API + '/stats');
+  const s = await res.json();
+  const grid = document.getElementById('stats-grid');
+
+  const uptime = s.uptime_seconds;
+  const h = Math.floor(uptime / 3600);
+  const m = Math.floor((uptime % 3600) / 60);
+  document.getElementById('stats-uptime').textContent = `Uptime: ${h}h ${m}m`;
+
+  grid.innerHTML = `
+    ${statCard('Requests', s.total_requests, `${s.total_streaming} streaming / ${s.total_non_streaming} non-streaming`)}
+    ${statCard('Tokens', formatNum(s.total_tokens), `${formatNum(s.total_prompt_tokens)} prompt / ${formatNum(s.total_completion_tokens)} completion`)}
+    ${statCard('Tool Calls', s.total_tool_calls, `${Object.keys(s.tool_usage).length} unique tools`)}
+    ${statCard('Optimizations', s.requests_coalesced + s.requests_cached, `${s.requests_coalesced} coalesced / ${s.requests_cached} cached / ${s.requests_aborted} aborted`)}
+    ${barCard('Tools Usage', s.tool_usage)}
+    ${barCard('Backends', s.backend_requests)}
+    ${barCard('Endpoints', s.requests_by_endpoint)}
+  `;
+}
+
+function statCard(title, value, sub) {
+  return `<div class="stat-card"><h4>${title}</h4><div class="stat-value">${value}</div><div class="stat-sub">${sub}</div></div>`;
+}
+
+function barCard(title, data) {
+  const entries = Object.entries(data);
+  if (!entries.length) return `<div class="stat-card"><h4>${title}</h4><div class="stat-sub">No data yet</div></div>`;
+  const max = Math.max(...entries.map(([, v]) => v));
+  const bars = entries.map(([name, count]) =>
+    `<li><span class="bar-label" title="${esc(name)}">${esc(name)}</span><span class="bar-track"><span class="bar-fill" style="width:${max ? (count/max*100) : 0}%"></span></span><span class="bar-count">${count}</span></li>`
+  ).join('');
+  return `<div class="stat-card"><h4>${title}</h4><ul class="stat-bar-list">${bars}</ul></div>`;
+}
+
+function formatNum(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+  return String(n);
+}
+
+async function resetStats() {
+  if (!confirm('Reset all stats?')) return;
+  await fetch(API + '/stats/reset', { method: 'POST' });
+  await loadStats();
+}
+
+// --- Abort ---
+async function abortAll() {
+  const btn = document.getElementById('abort-btn');
+  btn.textContent = 'Aborting…';
+  btn.disabled = true;
+  try {
+    const res = await fetch(API + '/abort', { method: 'POST' });
+    const data = await res.json();
+    btn.textContent = data.aborted > 0 ? `Aborted ${data.aborted}` : 'Nothing to abort';
+  } catch (e) { btn.textContent = 'Error'; }
+  setTimeout(() => { btn.textContent = 'Abort'; btn.disabled = false; }, 2000);
+}
+
+// --- Init ---
+loadConfig();
+initSSE();
+
+// Update default port when type changes
+document.getElementById('add-type').addEventListener('change', function() {
+  const ports = { ollama: 11434, lmstudio: 1234, llamacpp: 8080 };
+  document.getElementById('add-port').value = ports[this.value] || 8080;
+});
+</script>
+</body>
+</html>

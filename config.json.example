@@ -1,0 +1,27 @@
+{
+  "proxy_model_name": "proxy-model",
+  "timeout": 120,
+  "disable_thinking_global": false,
+  "backends": [
+    {
+      "id": "ollama1",
+      "name": "Local Ollama",
+      "type": "ollama",
+      "host": "127.0.0.1",
+      "port": 11434,
+      "model": "qwen3:8b",
+      "enabled": true,
+      "disable_thinking": false
+    },
+    {
+      "id": "lms1",
+      "name": "LM Studio",
+      "type": "lmstudio",
+      "host": "192.168.1.19",
+      "port": 1234,
+      "model": "qwen/qwen3.5-9b",
+      "enabled": true,
+      "disable_thinking": true
+    }
+  ]
+}
