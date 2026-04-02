@@ -171,6 +171,14 @@
           <select id="add-model-select" style="display:none; margin-top:6px" onchange="document.getElementById('add-model').value=this.value"></select>
         </div>
         <div>
+          <label>Weight</label>
+          <input id="add-weight" type="number" value="1" min="1">
+        </div>
+        <div>
+          <label>Max Concurrent (0=unlimited)</label>
+          <input id="add-max-concurrent" type="number" value="0" min="0">
+        </div>
+        <div>
           <label class="toggle">
             <input type="checkbox" id="add-disable-thinking">
             <span>Disable thinking</span>
@@ -202,6 +210,15 @@
       <div class="setting-row">
         <label>Timeout (seconds)</label>
         <input id="set-timeout" type="number" value="120">
+      </div>
+      <div class="setting-row">
+        <label>Load Balancing Strategy</label>
+        <select id="set-strategy">
+          <option value="priority">Priority (first available)</option>
+          <option value="round-robin">Round Robin</option>
+          <option value="least-connections">Least Connections</option>
+          <option value="weighted-round-robin">Weighted Round Robin</option>
+        </select>
       </div>
       <div class="setting-row">
         <label class="toggle">
@@ -257,6 +274,7 @@ async function loadConfig() {
 function renderSettings() {
   document.getElementById('set-model-name').value = config.proxy_model_name;
   document.getElementById('set-timeout').value = config.timeout;
+  document.getElementById('set-strategy').value = config.load_balancing_strategy || 'priority';
   document.getElementById('set-disable-thinking').checked = config.disable_thinking_global;
 }
 
@@ -264,6 +282,7 @@ async function saveSettings() {
   const body = {
     proxy_model_name: document.getElementById('set-model-name').value,
     timeout: parseInt(document.getElementById('set-timeout').value),
+    load_balancing_strategy: document.getElementById('set-strategy').value,
     disable_thinking_global: document.getElementById('set-disable-thinking').checked,
   };
   await fetch(API + '/config/settings', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
@@ -288,8 +307,10 @@ function renderBackends() {
       <div class="details">
         <div>Host: <span>${esc(b.host)}:${b.port}</span></div>
         <div>Model: <span>${esc(b.model || '(none)')}</span></div>
+        <div>Weight: <span>${b.weight || 1}</span></div>
+        <div>Max concurrent: <span>${b.max_concurrent || 'unlimited'}</span></div>
+        <div>Active: <span id="active-${b.id}">-</span></div>
         <div>Thinking: <span>${b.disable_thinking ? 'Disabled' : 'Enabled'}</span></div>
-        <div>Status: <span>${b.enabled ? 'Enabled' : 'Disabled'}</span></div>
       </div>
       <div class="actions">
         <button class="small secondary" onclick="moveBackend('${b.id}', -1)" ${idx === 0 ? 'disabled' : ''} title="Move up">▲</button>
@@ -313,6 +334,8 @@ async function addBackend() {
     host: document.getElementById('add-host').value,
     port: parseInt(document.getElementById('add-port').value),
     model: document.getElementById('add-model').value,
+    weight: parseInt(document.getElementById('add-weight').value) || 1,
+    max_concurrent: parseInt(document.getElementById('add-max-concurrent').value) || 0,
     disable_thinking: document.getElementById('add-disable-thinking').checked,
   };
   if (!body.name) return;
@@ -539,6 +562,23 @@ async function abortAll() {
   } catch (e) { btn.textContent = 'Error'; }
   setTimeout(() => { btn.textContent = 'Abort'; btn.disabled = false; }, 2000);
 }
+
+// --- Balancer status ---
+async function refreshBalancerStatus() {
+  try {
+    const res = await fetch(API + '/balancer');
+    const data = await res.json();
+    for (const [bid, state] of Object.entries(data.backends)) {
+      const el = document.getElementById('active-' + bid);
+      if (el) {
+        const s = state;
+        el.textContent = `${s.active_requests} active, ${s.total_requests} total, ${s.avg_latency_ms}ms avg`;
+        el.style.color = s.active_requests > 0 ? 'var(--accent)' : 'var(--fg2)';
+      }
+    }
+  } catch {}
+}
+setInterval(refreshBalancerStatus, 2000);
 
 // --- Init ---
 loadConfig();

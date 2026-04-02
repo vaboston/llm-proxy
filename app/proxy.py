@@ -16,6 +16,7 @@ from app.config import BackendConfig, get_config, should_filter_thinking
 from app.thinking import ThinkingFilter, strip_thinking
 from app.stats import stats
 from app.logs import log_manager
+from app.balancer import balancer
 
 # ==========================================================================
 # HTTP client
@@ -48,20 +49,36 @@ async def check_backend_health(backend: BackendConfig) -> bool:
         url = (f"{backend.base_url}/api/tags" if backend.type == "ollama"
                else f"{backend.base_url}/v1/models")
         resp = await client.get(url, timeout=3.0)
-        return resp.status_code == 200
+        healthy = resp.status_code == 200
+        balancer.mark_healthy(backend.id, healthy)
+        return healthy
     except Exception:
+        balancer.mark_healthy(backend.id, False)
         return False
 
 
 async def get_available_backend() -> BackendConfig | None:
-    """Return first enabled + reachable backend by priority order."""
+    """Select a backend using the configured load balancing strategy."""
+    available = []
     for b in get_config().backends:
         if not b.enabled:
             continue
+        # Check max_concurrent limit
+        if b.max_concurrent > 0:
+            state = balancer.get_state(b.id)
+            if state.active_requests >= b.max_concurrent:
+                log_manager.log("info", f"Backend '{b.name}' at capacity ({state.active_requests}/{b.max_concurrent})")
+                continue
         if await check_backend_health(b):
-            return b
-        log_manager.log("error", f"Backend '{b.name}' unreachable, trying next")
-    return None
+            available.append(b)
+        else:
+            log_manager.log("error", f"Backend '{b.name}' unreachable, skipping")
+
+    selected = await balancer.select_backend(available)
+    if selected:
+        log_manager.log("info", f"Selected backend '{selected.name}' (strategy={get_config().load_balancing_strategy}, "
+                        f"active={balancer.get_state(selected.id).active_requests})")
+    return selected
 
 
 async def fetch_backend_models(backend: BackendConfig) -> list[str]:
@@ -422,6 +439,21 @@ def _prepare_request(backend: BackendConfig, body: dict, inject_no_think: bool, 
         url = f"{backend.base_url}/v1/chat/completions"
         req = ollama_to_openai_request(body, backend.model, no_think=inject_no_think)
     return url, req
+
+
+async def _tracked_stream(backend_id: str, gen):
+    """Wrap an async generator with request tracking."""
+    tracker = balancer.track(backend_id)
+    tracker.__enter__()
+    exc_info = (None, None, None)
+    try:
+        async for chunk in gen:
+            yield chunk
+    except BaseException as e:
+        exc_info = (type(e), e, e.__traceback__)
+        raise
+    finally:
+        tracker.__exit__(*exc_info)
 
 
 async def stream_chat_ollama_out(backend: BackendConfig, body: dict):

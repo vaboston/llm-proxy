@@ -18,6 +18,8 @@ class BackendConfig(BaseModel):
     model: str = ""
     enabled: bool = True
     disable_thinking: bool = False
+    weight: int = 1              # for weighted-round-robin
+    max_concurrent: int = 0      # 0 = unlimited
 
     @property
     def base_url(self) -> str:
@@ -28,6 +30,7 @@ class GlobalConfig(BaseModel):
     proxy_model_name: str = "proxy-model"
     timeout: int = 120
     disable_thinking_global: bool = False
+    load_balancing_strategy: str = "priority"  # priority | round-robin | least-connections | weighted-round-robin
     backends: list[BackendConfig] = Field(default_factory=list)
 
 
