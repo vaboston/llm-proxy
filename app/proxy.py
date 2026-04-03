@@ -126,11 +126,17 @@ async def fetch_backend_models(backend: BackendConfig) -> list[str]:
 # ==========================================================================
 
 _THINKING_MODELS = ("qwen3", "qwq", "deepseek-r1")
+_GEMMA_MODELS = ("gemma",)
 
 
 def _is_thinking_model(model_name: str) -> bool:
     lower = model_name.lower()
     return any(t in lower for t in _THINKING_MODELS)
+
+
+def _is_gemma_model(model_name: str) -> bool:
+    lower = model_name.lower()
+    return any(t in lower for t in _GEMMA_MODELS)
 
 
 def _inject_no_think(messages: list[dict]) -> list[dict]:
@@ -148,6 +154,60 @@ def _inject_no_think(messages: list[dict]) -> list[dict]:
 # ==========================================================================
 # Message format sanitization
 # ==========================================================================
+
+def _sanitize_messages_for_gemma(messages: list[dict]) -> list[dict]:
+    """Sanitize messages for Gemma 4 compatibility.
+
+    Gemma 4 only supports a single system turn at the beginning.
+    - Merges all system messages into one at position 0
+    - Removes tool_calls from assistant messages in history (Gemma 4's
+      native tool format is handled by LM Studio's template; passing
+      OpenAI-format tool_calls in history can break the template)
+    - Strips reasoning_content that may have leaked into history
+    - Converts tool_calls[].function.arguments from dict to JSON string
+      (Ollama stores arguments as a parsed object; OpenAI/LM Studio requires
+      a JSON string — sending a dict causes 400 "Invalid 'content'" from LM Studio)
+    """
+    # Collect all system message contents
+    system_parts = []
+    non_system = []
+    for m in messages:
+        if m.get("role") == "system":
+            content = m.get("content", "") or ""
+            if content:
+                system_parts.append(content)
+        else:
+            non_system.append(m.copy())
+
+    result = []
+    if system_parts:
+        result.append({"role": "system", "content": "\n\n".join(system_parts)})
+
+    for m in non_system:
+        # Strip fields that can break Gemma's template
+        m.pop("reasoning_content", None)
+        # Convert tool_calls arguments from dict (Ollama) to JSON string (OpenAI)
+        if m.get("tool_calls"):
+            fixed = []
+            for tc in m["tool_calls"]:
+                tc = tc.copy()
+                fn = tc.get("function", {})
+                if isinstance(fn, dict):
+                    fn = fn.copy()
+                    args = fn.get("arguments")
+                    if isinstance(args, dict):
+                        fn["arguments"] = json.dumps(args)
+                    tc["function"] = fn
+                fixed.append(tc)
+            m["tool_calls"] = fixed
+        result.append(m)
+
+    if len(system_parts) > 1:
+        log_manager.log("info",
+            f"[gemma] merged {len(system_parts)} system messages into one")
+
+    return result
+
 
 def _sanitize_messages_for_cloud(messages: list[dict]) -> list[dict]:
     """Sanitize messages for cloud APIs (Moonshot Kimi, etc.).
@@ -212,6 +272,8 @@ def _forward_tools(body: dict, out: dict):
 def ollama_to_openai_request(body: dict, model: str, no_think: bool = False) -> dict:
     """Ollama /api/chat body -> OpenAI /v1/chat/completions body."""
     messages = body.get("messages", [])
+    if _is_gemma_model(model):
+        messages = _sanitize_messages_for_gemma(messages)
     if no_think and _is_thinking_model(model):
         messages = _inject_no_think(messages)
     out = {"model": model, "messages": messages, "stream": body.get("stream", True)}
@@ -407,8 +469,18 @@ async def _iter_openai_stream(response: httpx.Response):
 # Request deduplication
 # ==========================================================================
 
+class BackendRetryableError(Exception):
+    """Raised when a backend returns a retryable status (429, 502, 503)."""
+    def __init__(self, backend_name: str, status_code: int):
+        self.backend_name = backend_name
+        self.status_code = status_code
+        super().__init__(f"{backend_name} returned {status_code}")
+
+
 _inflight: dict[str, asyncio.Task] = {}
-_RESULT_CACHE_TTL = 120  # seconds to keep completed results
+_RESULT_CACHE_TTL = 300  # seconds to keep completed results
+
+_RETRYABLE_STATUS = {429, 503, 502}
 
 
 def abort_all_inflight() -> int:
@@ -432,38 +504,78 @@ def _request_key(body: dict) -> str:
 
 
 async def _coalesced_stream_and_buffer(backend, body) -> tuple[str, list]:
-    """Deduplicated _stream_and_buffer.
+    """Deduplicated _stream_and_buffer with retry on 429/502/503.
 
     If an identical request is already in-flight, wait for it instead of
-    starting a new one. Completed results are cached for 120s.
+    starting a new one. Completed results are cached for 5 minutes.
+    On retryable errors, automatically tries the next available backend.
     """
     key = _request_key(body)
 
     if key in _inflight:
         task = _inflight[key]
         if task.done():
-            log_manager.log("info", "returning cached result for duplicate request")
-            stats.record_cached()
-            return task.result()
-        log_manager.log("info", "request coalesced - waiting for in-flight duplicate")
-        stats.record_coalesced()
+            # Check if the cached result was an error
+            try:
+                result = task.result()
+                log_manager.log("info", "returning cached result for duplicate request")
+                stats.record_cached()
+                return result
+            except BackendRetryableError:
+                _inflight.pop(key, None)  # Clear failed cache, retry below
+            except Exception:
+                _inflight.pop(key, None)
+        else:
+            log_manager.log("info", "request coalesced - waiting for in-flight duplicate")
+            stats.record_coalesced()
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                log_manager.log("info", "client disconnected, backend task continues in background")
+                raise
+            except BackendRetryableError:
+                pass  # Fall through to retry below
+
+    # Try with the given backend, then fallback to others on retryable errors
+    tried = {backend.id}
+    current_backend = backend
+
+    while True:
+        task = asyncio.create_task(_stream_and_buffer(current_backend, body))
+        _inflight[key] = task
+        task.add_done_callback(
+            lambda t, k=key: asyncio.get_event_loop().call_later(
+                _RESULT_CACHE_TTL, lambda: _inflight.pop(k, None))
+        )
+
         try:
-            return await asyncio.shield(task)
+            result = await asyncio.shield(task)
+            return result
         except asyncio.CancelledError:
             log_manager.log("info", "client disconnected, backend task continues in background")
             raise
+        except BackendRetryableError as e:
+            _inflight.pop(key, None)
+            balancer.mark_error(current_backend.id)
+            log_manager.log("info",
+                f"Backend '{e.backend_name}' returned {e.status_code}, trying next backend")
 
-    task = asyncio.create_task(_stream_and_buffer(backend, body))
-    _inflight[key] = task
-    task.add_done_callback(
-        lambda t: asyncio.get_event_loop().call_later(_RESULT_CACHE_TTL, lambda: _inflight.pop(key, None))
-    )
+            # Find next available backend
+            next_backend = None
+            for b in get_config().backends:
+                if not b.enabled or b.id in tried:
+                    continue
+                if await check_backend_health(b):
+                    next_backend = b
+                    break
 
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        log_manager.log("info", "client disconnected, backend task continues in background")
-        raise
+            if next_backend is None:
+                log_manager.log("error", "All backends failed or exhausted")
+                return f"[All backends unavailable (last: {e.status_code})]", []
+
+            tried.add(next_backend.id)
+            current_backend = next_backend
+            log_manager.log("info", f"Retrying with backend '{current_backend.name}'")
 
 
 # ==========================================================================
@@ -484,6 +596,16 @@ def _prepare_request(backend: BackendConfig, body: dict, inject_no_think: bool, 
         if _is_cloud(backend):
             req["messages"] = _sanitize_messages_for_cloud(req["messages"])
     return url, req
+
+
+async def _find_fallback_backend(exclude: set[str] = set()) -> BackendConfig | None:
+    """Find next available backend, excluding already-tried ones."""
+    for b in get_config().backends:
+        if not b.enabled or b.id in exclude:
+            continue
+        if await check_backend_health(b):
+            return b
+    return None
 
 
 async def _tracked_stream(backend_id: str, gen):
@@ -511,20 +633,6 @@ async def stream_chat_ollama_out(backend: BackendConfig, body: dict):
 
     target_url, request_body = _prepare_request(backend, body, inject_no_think, is_reasoning)
 
-    # Debug: log message structure for cloud backends
-    if _is_cloud(backend):
-        msg_debug = []
-        for i, m in enumerate(request_body.get("messages", [])):
-            info = {"idx": i, "role": m.get("role")}
-            if m.get("tool_calls"):
-                info["tool_calls"] = len(m["tool_calls"])
-            if "reasoning_content" in m:
-                info["has_reasoning"] = True
-            if m.get("role") == "tool":
-                info["tool_call_id"] = m.get("tool_call_id", "?")
-            msg_debug.append(info)
-        log_manager.log("info", f"[cloud-debug-ollama-out] {len(msg_debug)} msgs", {"messages": msg_debug})
-
     log_manager.log("request", f"-> {backend.name} ({backend.type}) {target_url}",
                     {"backend": backend.name, "model": backend.model})
 
@@ -536,8 +644,17 @@ async def stream_chat_ollama_out(backend: BackendConfig, body: dict):
 
         if response.status_code != 200:
             error_body = await response.aread()
-            log_manager.log("error", f"Backend returned {response.status_code}",
+            log_manager.log("error", f"Backend '{backend.name}' returned {response.status_code}",
                             {"body": error_body.decode(errors="replace")})
+            # On retryable errors, try next backend
+            if response.status_code in _RETRYABLE_STATUS:
+                balancer.mark_error(backend.id)
+                next_b = await _find_fallback_backend(exclude={backend.id})
+                if next_b:
+                    log_manager.log("info", f"Retrying with backend '{next_b.name}'")
+                    async for chunk in stream_chat_ollama_out(next_b, body):
+                        yield chunk
+                    return
             yield json.dumps({"model": cfg.proxy_model_name,
                               "message": {"role": "assistant", "content": f"[Proxy error: backend returned {response.status_code}]"},
                               "done": True}) + "\n"
@@ -622,29 +739,14 @@ async def stream_chat_openai_out(backend: BackendConfig, body: dict):
     else:
         target_url = _chat_url(backend)
         request_body = {**body, "model": backend.model}
+        msgs = request_body.get("messages", [])
+        if _is_gemma_model(backend.model):
+            msgs = _sanitize_messages_for_gemma(msgs)
         if _is_cloud(backend):
-            request_body["messages"] = _sanitize_messages_for_cloud(request_body.get("messages", []))
+            msgs = _sanitize_messages_for_cloud(msgs)
         if inject_no_think and is_reasoning:
-            request_body["messages"] = _inject_no_think(request_body.get("messages", []))
-
-    # Debug: log message structure for cloud backends
-    if _is_cloud(backend):
-        msg_debug = []
-        for i, m in enumerate(request_body.get("messages", [])):
-            info = {"idx": i, "role": m.get("role"), "keys": list(m.keys())}
-            if m.get("tool_calls"):
-                info["tool_calls"] = len(m["tool_calls"])
-            if "reasoning_content" in m:
-                info["has_reasoning"] = True
-                info["reasoning_val"] = repr(m["reasoning_content"])[:50]
-            if m.get("role") == "tool":
-                info["tool_call_id"] = m.get("tool_call_id", "?")
-            msg_debug.append(info)
-        log_manager.log("info", f"[cloud-debug] sending {len(msg_debug)} messages", {"messages": msg_debug})
-        # Also log the raw JSON that will be sent for the problematic messages
-        for i, m in enumerate(request_body.get("messages", [])):
-            if m.get("role") == "assistant":
-                log_manager.log("info", f"[cloud-raw-msg-{i}] {json.dumps(m)[:300]}")
+            msgs = _inject_no_think(msgs)
+        request_body["messages"] = msgs
 
     log_manager.log("request", f"-> {backend.name} ({backend.type}) {target_url}",
                     {"backend": backend.name, "model": backend.model})
@@ -654,8 +756,16 @@ async def stream_chat_openai_out(backend: BackendConfig, body: dict):
                              timeout=httpx.Timeout(cfg.timeout, connect=5.0)) as response:
         if response.status_code != 200:
             error_body = await response.aread()
-            log_manager.log("error", f"Backend returned {response.status_code}",
+            log_manager.log("error", f"Backend '{backend.name}' returned {response.status_code}",
                             {"body": error_body.decode(errors="replace")})
+            if response.status_code in _RETRYABLE_STATUS:
+                balancer.mark_error(backend.id)
+                next_b = await _find_fallback_backend(exclude={backend.id})
+                if next_b:
+                    log_manager.log("info", f"Retrying with backend '{next_b.name}'")
+                    async for chunk in stream_chat_openai_out(next_b, body):
+                        yield chunk
+                    return
             yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': f'[Proxy error: backend returned {response.status_code}]'}, 'finish_reason': 'stop'}]})}\n\n"
             yield "data: [DONE]\n\n"
             return
@@ -800,10 +910,12 @@ async def _stream_and_buffer(backend: BackendConfig, body: dict) -> tuple[str, l
 
     if backend.type == "ollama":
         target_url = f"{backend.base_url}/api/chat"
-        request_body = {**body, "model": backend.model, "stream": True,
-                        "messages": _sanitize_messages_for_ollama(body.get("messages", []))}
+        msgs = _sanitize_messages_for_ollama(body.get("messages", []))
+        if _is_gemma_model(backend.model):
+            msgs = _sanitize_messages_for_gemma(msgs)
         if inject_no_think and is_reasoning:
-            request_body["messages"] = _inject_no_think(request_body["messages"])
+            msgs = _inject_no_think(msgs)
+        request_body = {**body, "model": backend.model, "stream": True, "messages": msgs}
     else:
         target_url = _chat_url(backend)
         request_body = ollama_to_openai_request(body, backend.model, no_think=inject_no_think)
@@ -822,8 +934,10 @@ async def _stream_and_buffer(backend: BackendConfig, body: dict) -> tuple[str, l
                              timeout=httpx.Timeout(cfg.timeout, connect=5.0)) as response:
         if response.status_code != 200:
             error_body = await response.aread()
-            log_manager.log("error", f"Backend returned {response.status_code}",
+            log_manager.log("error", f"Backend '{backend.name}' returned {response.status_code}",
                             {"body": error_body.decode(errors="replace")})
+            if response.status_code in _RETRYABLE_STATUS:
+                raise BackendRetryableError(backend.name, response.status_code)
             return f"[Backend error: {response.status_code}]", []
 
         if backend.type == "ollama":
