@@ -6,7 +6,8 @@ Tested with **Ollama**, **LM Studio** (Qwen3.5-9B), and **Moonshot AI** (Kimi K2
 
 ## Features
 
-- **Multi-backend**: supports Ollama, LM Studio, and llama.cpp. Each backend is configured with host, port, and model. Automatic fallback by priority order if a backend is unreachable.
+- **Multi-backend**: supports Ollama, LM Studio, llama.cpp, and cloud APIs (Moonshot AI, OpenRouter, etc.). Each backend is configured with host, port, and model. Automatic fallback by priority order if a backend is unreachable.
+- **Load balancing**: distribute requests across backends with priority, round-robin, least-connections, or weighted round-robin strategies. Per-backend weight and max concurrent settings.
 - **Dual API**: exposes Ollama endpoints (`/api/chat`, `/api/generate`, `/api/tags`) and OpenAI endpoints (`/v1/chat/completions`, `/v1/models`). Translates between formats transparently.
 - **Tool calling**: full support for `tools`, `tool_choice`, and `tool_calls` in both directions. Handles the OpenAI string-arguments vs Ollama object-arguments difference automatically.
 - **Thinking suppression**: for reasoning models (Qwen3, QwQ, DeepSeek-R1), strips `<think>...</think>` blocks and `reasoning_content` from responses. Optionally injects `/no_think` to prevent thinking entirely.
@@ -165,6 +166,33 @@ Cloud backends connect to remote APIs (Moonshot AI, OpenRouter, Together AI, Gro
 
 API keys are masked in the Web UI and API responses. The `config.json` file (which stores keys in plaintext) is excluded from git via `.gitignore`.
 
+### Load balancing
+
+The proxy can distribute requests across multiple backends. Configure the strategy in Settings:
+
+| Strategy | Behavior |
+|----------|----------|
+| `priority` | First available backend by list order (default) |
+| `round-robin` | Rotate evenly between available backends |
+| `least-connections` | Pick the backend with fewest active requests |
+| `weighted-round-robin` | Rotate with weights (set per backend) |
+
+**Per-backend settings:**
+
+- **Weight** — relative share of traffic for weighted round-robin (default: 1)
+- **Max concurrent** — limit simultaneous requests to this backend (0 = unlimited)
+
+**Examples:**
+
+| Goal | Strategy | Backend A weight | Backend B weight |
+|------|----------|-----------------|-----------------|
+| 50/50 split | `round-robin` | — | — |
+| 75/25 split | `weighted-round-robin` | 3 | 1 |
+| 2:1 ratio | `weighted-round-robin` | 2 | 1 |
+| Always prefer A | `priority` | — (A first in list) | — |
+
+The Web UI shows live active request counts and average latency per backend. The `GET /balancer` endpoint returns the full state.
+
 ### Thinking suppression
 
 For reasoning models (Qwen3, QwQ, DeepSeek-R1):
@@ -198,6 +226,7 @@ For reasoning models (Qwen3, QwQ, DeepSeek-R1):
 | `POST /config/backends/probe-models` | Fetch models from arbitrary host |
 | `GET /config/backends/{id}/models` | Fetch models from saved backend |
 | `GET /config/backends/{id}/health` | Health check |
+| `GET /balancer` | Load balancer state (active requests, latency) |
 | `POST /abort` | Cancel all in-flight requests |
 | `GET /stats` | Usage statistics |
 | `POST /stats/reset` | Reset statistics |

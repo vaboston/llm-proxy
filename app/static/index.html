@@ -59,6 +59,10 @@
   .backend-card .details span { font-family: monospace; color: var(--fg); }
   .backend-card .actions { display: flex; gap: 8px; margin-top: 12px; }
   .backend-card .priority { color: var(--fg3); font-size: 12px; font-weight: 600; min-width: 20px; }
+  .backend-card .edit-form { margin-top: 12px; border-top: 1px solid var(--bg4); padding-top: 12px; }
+  .backend-card .edit-form .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+  .backend-card .edit-form .form-grid .full { grid-column: 1 / -1; }
+  .backend-card .edit-form .edit-actions { display: flex; gap: 8px; }
 
   /* Add backend form */
   .add-form { background: var(--bg2); border: 1px solid var(--bg4); border-radius: var(--radius); padding: 20px; }
@@ -195,6 +199,14 @@
           <select id="add-model-select" style="display:none; margin-top:6px" onchange="document.getElementById('add-model').value=this.value"></select>
         </div>
         <div>
+          <label>Weight</label>
+          <input id="add-weight" type="number" value="1" min="1">
+        </div>
+        <div>
+          <label>Max Concurrent (0=unlimited)</label>
+          <input id="add-max-concurrent" type="number" value="0" min="0">
+        </div>
+        <div>
           <label class="toggle">
             <input type="checkbox" id="add-disable-thinking">
             <span>Disable thinking</span>
@@ -226,6 +238,15 @@
       <div class="setting-row">
         <label>Timeout (seconds)</label>
         <input id="set-timeout" type="number" value="120">
+      </div>
+      <div class="setting-row">
+        <label>Load Balancing Strategy</label>
+        <select id="set-strategy">
+          <option value="priority">Priority (first available)</option>
+          <option value="round-robin">Round Robin</option>
+          <option value="least-connections">Least Connections</option>
+          <option value="weighted-round-robin">Weighted Round Robin</option>
+        </select>
       </div>
       <div class="setting-row">
         <label class="toggle">
@@ -281,6 +302,7 @@ async function loadConfig() {
 function renderSettings() {
   document.getElementById('set-model-name').value = config.proxy_model_name;
   document.getElementById('set-timeout').value = config.timeout;
+  document.getElementById('set-strategy').value = config.load_balancing_strategy || 'priority';
   document.getElementById('set-disable-thinking').checked = config.disable_thinking_global;
 }
 
@@ -288,6 +310,7 @@ async function saveSettings() {
   const body = {
     proxy_model_name: document.getElementById('set-model-name').value,
     timeout: parseInt(document.getElementById('set-timeout').value),
+    load_balancing_strategy: document.getElementById('set-strategy').value,
     disable_thinking_global: document.getElementById('set-disable-thinking').checked,
   };
   await fetch(API + '/config/settings', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
@@ -313,17 +336,21 @@ function renderBackends() {
         <div>${b.api_base ? 'URL' : 'Host'}: <span>${esc(b.api_base || (b.host + ':' + b.port))}</span></div>
         <div>Model: <span>${esc(b.model || '(none)')}</span></div>
         ${b.api_key ? '<div>API Key: <span>****' + esc(b.api_key.slice(-4)) + '</span></div>' : ''}
+        <div>Weight: <span>${b.weight || 1}</span></div>
+        <div>Max concurrent: <span>${b.max_concurrent || 'unlimited'}</span></div>
+        <div>Active: <span id="active-${b.id}">-</span></div>
         <div>Thinking: <span>${b.disable_thinking ? 'Disabled' : 'Enabled'}</span></div>
-        <div>Status: <span>${b.enabled ? 'Enabled' : 'Disabled'}</span></div>
       </div>
       <div class="actions">
         <button class="small secondary" onclick="moveBackend('${b.id}', -1)" ${idx === 0 ? 'disabled' : ''} title="Move up">▲</button>
         <button class="small secondary" onclick="moveBackend('${b.id}', 1)" ${idx === config.backends.length - 1 ? 'disabled' : ''} title="Move down">▼</button>
         <button class="small secondary" onclick="checkHealth('${b.id}')">Check</button>
+        <button class="small secondary" onclick="editBackend('${b.id}')">Edit</button>
         <button class="small secondary" onclick="toggleBackend('${b.id}', ${!b.enabled})">${b.enabled ? 'Disable' : 'Enable'}</button>
         <button class="small secondary" onclick="fetchModels('${b.id}')">Fetch Models</button>
         <button class="small danger" onclick="deleteBackend('${b.id}')">Delete</button>
       </div>
+      <div class="edit-form" id="edit-${b.id}" style="display:none"></div>
     `;
     list.appendChild(card);
     // Auto-check health
@@ -340,6 +367,8 @@ async function addBackend() {
     host: isCloud ? '0.0.0.0' : document.getElementById('add-host').value,
     port: isCloud ? 0 : parseInt(document.getElementById('add-port').value),
     model: document.getElementById('add-model').value,
+    weight: parseInt(document.getElementById('add-weight').value) || 1,
+    max_concurrent: parseInt(document.getElementById('add-max-concurrent').value) || 0,
     disable_thinking: document.getElementById('add-disable-thinking').checked,
   };
   if (isCloud) {
@@ -362,6 +391,97 @@ async function moveBackend(id, direction) {
   ids.splice(idx, 1);
   ids.splice(newIdx, 0, id);
   await fetch(API + '/config/backends/reorder', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ids}) });
+  await loadConfig();
+}
+
+function editBackend(id) {
+  const b = config.backends.find(x => x.id === id);
+  if (!b) return;
+  const el = document.getElementById('edit-' + id);
+  if (el.style.display !== 'none') { el.style.display = 'none'; return; }
+  const isCloud = b.type === 'cloud' || b.api_base;
+  el.innerHTML = `
+    <div class="form-grid">
+      <div>
+        <label>Name</label>
+        <input id="edit-name-${id}" value="${esc(b.name)}">
+      </div>
+      <div>
+        <label>Type</label>
+        <select id="edit-type-${id}">
+          <option value="ollama" ${b.type==='ollama'?'selected':''}>Ollama</option>
+          <option value="lmstudio" ${b.type==='lmstudio'?'selected':''}>LM Studio</option>
+          <option value="llamacpp" ${b.type==='llamacpp'?'selected':''}>llama.cpp</option>
+          <option value="cloud" ${b.type==='cloud'?'selected':''}>Cloud API</option>
+        </select>
+      </div>
+      <div id="edit-host-row-${id}" ${isCloud?'style="display:none"':''}>
+        <label>Host</label>
+        <input id="edit-host-${id}" value="${esc(b.host)}">
+      </div>
+      <div id="edit-port-row-${id}" ${isCloud?'style="display:none"':''}>
+        <label>Port</label>
+        <input id="edit-port-${id}" type="number" value="${b.port}">
+      </div>
+      <div class="full" id="edit-cloud-row-${id}" ${isCloud?'':'style="display:none"'}>
+        <label>API Base URL</label>
+        <input id="edit-api-base-${id}" value="${esc(b.api_base || '')}">
+      </div>
+      <div class="full" id="edit-key-row-${id}" ${isCloud?'':'style="display:none"'}>
+        <label>API Key (leave empty to keep current)</label>
+        <input id="edit-api-key-${id}" type="password" placeholder="unchanged">
+      </div>
+      <div class="full">
+        <label>Model</label>
+        <input id="edit-model-${id}" value="${esc(b.model)}">
+      </div>
+      <div>
+        <label>Weight</label>
+        <input id="edit-weight-${id}" type="number" value="${b.weight || 1}" min="1">
+      </div>
+      <div>
+        <label>Max Concurrent (0=unlimited)</label>
+        <input id="edit-maxconc-${id}" type="number" value="${b.max_concurrent || 0}" min="0">
+      </div>
+      <div>
+        <label class="toggle">
+          <input type="checkbox" id="edit-thinking-${id}" ${b.disable_thinking?'checked':''}>
+          <span>Disable thinking</span>
+        </label>
+      </div>
+    </div>
+    <div class="edit-actions">
+      <button class="small" onclick="saveBackendEdit('${id}')">Save</button>
+      <button class="small secondary" onclick="document.getElementById('edit-${id}').style.display='none'">Cancel</button>
+    </div>
+  `;
+  el.style.display = '';
+  // Toggle local/cloud fields on type change
+  document.getElementById('edit-type-' + id).addEventListener('change', function() {
+    const cloud = this.value === 'cloud';
+    document.getElementById('edit-host-row-' + id).style.display = cloud ? 'none' : '';
+    document.getElementById('edit-port-row-' + id).style.display = cloud ? 'none' : '';
+    document.getElementById('edit-cloud-row-' + id).style.display = cloud ? '' : 'none';
+    document.getElementById('edit-key-row-' + id).style.display = cloud ? '' : 'none';
+  });
+}
+
+async function saveBackendEdit(id) {
+  const body = {
+    name: document.getElementById('edit-name-' + id).value,
+    type: document.getElementById('edit-type-' + id).value,
+    host: document.getElementById('edit-host-' + id).value,
+    port: parseInt(document.getElementById('edit-port-' + id).value) || 0,
+    model: document.getElementById('edit-model-' + id).value,
+    weight: parseInt(document.getElementById('edit-weight-' + id).value) || 1,
+    max_concurrent: parseInt(document.getElementById('edit-maxconc-' + id).value) || 0,
+    disable_thinking: document.getElementById('edit-thinking-' + id).checked,
+  };
+  const apiBase = document.getElementById('edit-api-base-' + id).value;
+  if (apiBase) body.api_base = apiBase;
+  const apiKey = document.getElementById('edit-api-key-' + id).value;
+  if (apiKey) body.api_key = apiKey;
+  await fetch(API + '/config/backends/' + id, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
   await loadConfig();
 }
 
@@ -570,6 +690,23 @@ async function abortAll() {
   } catch (e) { btn.textContent = 'Error'; }
   setTimeout(() => { btn.textContent = 'Abort'; btn.disabled = false; }, 2000);
 }
+
+// --- Balancer status ---
+async function refreshBalancerStatus() {
+  try {
+    const res = await fetch(API + '/balancer');
+    const data = await res.json();
+    for (const [bid, state] of Object.entries(data.backends)) {
+      const el = document.getElementById('active-' + bid);
+      if (el) {
+        const s = state;
+        el.textContent = `${s.active_requests} active, ${s.total_requests} total, ${s.avg_latency_ms}ms avg`;
+        el.style.color = s.active_requests > 0 ? 'var(--accent)' : 'var(--fg2)';
+      }
+    }
+  } catch {}
+}
+setInterval(refreshBalancerStatus, 2000);
 
 // --- Init ---
 loadConfig();

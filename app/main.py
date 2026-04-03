@@ -14,10 +14,11 @@ from app.proxy import (
     get_available_backend, fetch_backend_models, close_client,
     stream_chat_ollama_out, stream_chat_openai_out, stream_generate_ollama_out,
     non_stream_chat_ollama, non_stream_chat_openai, check_backend_health,
-    abort_all_inflight,
+    abort_all_inflight, _tracked_stream,
 )
 from app.logs import log_manager
 from app.stats import stats
+from app.balancer import balancer
 
 
 @asynccontextmanager
@@ -84,12 +85,13 @@ async def ollama_chat(request: Request):
 
     if stream:
         return StreamingResponse(
-            stream_chat_ollama_out(backend, body),
+            _tracked_stream(backend.id, stream_chat_ollama_out(backend, body)),
             media_type="application/x-ndjson",
         )
     else:
         async def _gen():
-            result = await non_stream_chat_ollama(backend, body)
+            with balancer.track(backend.id):
+                result = await non_stream_chat_ollama(backend, body)
             yield json.dumps(result)
         return StreamingResponse(_gen(), media_type="application/json")
 
@@ -107,7 +109,7 @@ async def ollama_generate(request: Request):
 
     if stream:
         return StreamingResponse(
-            stream_generate_ollama_out(backend, body),
+            _tracked_stream(backend.id, stream_generate_ollama_out(backend, body)),
             media_type="application/x-ndjson",
         )
     else:
@@ -121,8 +123,9 @@ async def ollama_generate(request: Request):
             chat_body["options"] = body["options"]
 
         async def _gen():
-            result = await non_stream_chat_ollama(backend, chat_body)
-            content = result.get("message", {}).get("content", "")
+            with balancer.track(backend.id):
+                result = await non_stream_chat_ollama(backend, chat_body)
+                content = result.get("message", {}).get("content", "")
             yield json.dumps({
                 "model": get_config().proxy_model_name,
                 "response": content, "done": True,
@@ -173,12 +176,13 @@ async def openai_chat(request: Request):
 
     if stream:
         return StreamingResponse(
-            stream_chat_openai_out(backend, body),
+            _tracked_stream(backend.id, stream_chat_openai_out(backend, body)),
             media_type="text/event-stream",
         )
     else:
         async def _gen():
-            result = await non_stream_chat_openai(backend, body)
+            with balancer.track(backend.id):
+                result = await non_stream_chat_openai(backend, body)
             yield json.dumps(result)
         return StreamingResponse(_gen(), media_type="application/json")
 
@@ -209,7 +213,7 @@ async def get_full_config():
 async def update_settings(request: Request):
     body = await request.json()
     cfg = get_config()
-    for key in ("proxy_model_name", "timeout", "disable_thinking_global"):
+    for key in ("proxy_model_name", "timeout", "disable_thinking_global", "load_balancing_strategy"):
         if key in body:
             setattr(cfg, key, body[key])
     save_config()
@@ -310,6 +314,14 @@ async def backend_health(backend_id: str):
 # ==========================================================================
 # Abort / Stats / Logs
 # ==========================================================================
+
+@app.get("/balancer")
+async def get_balancer_status():
+    return {
+        "strategy": get_config().load_balancing_strategy,
+        "backends": balancer.get_all_states(),
+    }
+
 
 @app.post("/abort")
 async def abort_requests():
