@@ -576,6 +576,10 @@ async def _coalesced_stream_and_buffer(backend, body) -> tuple[str, list]:
             tried.add(next_backend.id)
             current_backend = next_backend
             log_manager.log("info", f"Retrying with backend '{current_backend.name}'")
+        except Exception as exc:
+            _inflight.pop(key, None)
+            log_manager.log("error", f"Unexpected error from backend '{current_backend.name}': {type(exc).__name__}: {exc}")
+            return f"[Proxy error: {type(exc).__name__}]", []
 
 
 # ==========================================================================
@@ -636,86 +640,108 @@ async def stream_chat_ollama_out(backend: BackendConfig, body: dict):
     log_manager.log("request", f"-> {backend.name} ({backend.type}) {target_url}",
                     {"backend": backend.name, "model": backend.model})
 
-    async with client.stream("POST", target_url, json=request_body,
-                             headers=_auth_headers(backend),
-                             timeout=httpx.Timeout(cfg.timeout, connect=5.0)) as response:
-        ct = response.headers.get("content-type", "?")
-        log_manager.log("info", f"[backend] HTTP {response.status_code} content-type={ct}")
+    total_content = ""
+    try:
+        async with client.stream("POST", target_url, json=request_body,
+                                 headers=_auth_headers(backend),
+                                 timeout=httpx.Timeout(cfg.timeout, connect=5.0)) as response:
+            ct = response.headers.get("content-type", "?")
+            log_manager.log("info", f"[backend] HTTP {response.status_code} content-type={ct}")
 
-        if response.status_code != 200:
-            error_body = await response.aread()
-            log_manager.log("error", f"Backend '{backend.name}' returned {response.status_code}",
-                            {"body": error_body.decode(errors="replace")})
-            # On retryable errors, try next backend
-            if response.status_code in _RETRYABLE_STATUS:
-                balancer.mark_error(backend.id)
-                next_b = await _find_fallback_backend(exclude={backend.id})
-                if next_b:
-                    log_manager.log("info", f"Retrying with backend '{next_b.name}'")
-                    async for chunk in stream_chat_ollama_out(next_b, body):
-                        yield chunk
-                    return
-            yield json.dumps({"model": cfg.proxy_model_name,
-                              "message": {"role": "assistant", "content": f"[Proxy error: backend returned {response.status_code}]"},
-                              "done": True}) + "\n"
-            return
+            if response.status_code != 200:
+                error_body = await response.aread()
+                log_manager.log("error", f"Backend '{backend.name}' returned {response.status_code}",
+                                {"body": error_body.decode(errors="replace")})
+                # On retryable errors, try next backend
+                if response.status_code in _RETRYABLE_STATUS:
+                    balancer.mark_error(backend.id)
+                    next_b = await _find_fallback_backend(exclude={backend.id})
+                    if next_b:
+                        log_manager.log("info", f"Retrying with backend '{next_b.name}'")
+                        async for chunk in stream_chat_ollama_out(next_b, body):
+                            yield chunk
+                        return
+                yield json.dumps({"model": cfg.proxy_model_name,
+                                  "message": {"role": "assistant", "content": f"[Proxy error: backend returned {response.status_code}]"},
+                                  "done": True}) + "\n"
+                return
 
-        total_content = ""
-        if backend.type == "ollama":
-            async for chunk in _iter_ollama_stream(response):
-                content = chunk.get("message", {}).get("content", "")
-                done = chunk.get("done", False)
-                if thinking_filter:
-                    content = thinking_filter.feed(content)
-                    if done:
-                        content += thinking_filter.flush()
-                total_content += content
-                chunk["model"] = cfg.proxy_model_name
-                chunk["message"]["content"] = content
-                if content or done:
-                    yield json.dumps(chunk) + "\n"
-        else:
-            async for chunk in _iter_openai_stream(response):
-                if chunk is None:
-                    remaining = thinking_filter.flush() if thinking_filter else ""
-                    total_content += remaining
-                    yield json.dumps({
-                        "model": cfg.proxy_model_name,
-                        "message": {"role": "assistant", "content": remaining},
-                        "done": True,
-                        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-                    }) + "\n"
-                    break
+            if backend.type == "ollama":
+                async for chunk in _iter_ollama_stream(response):
+                    content = chunk.get("message", {}).get("content", "")
+                    done = chunk.get("done", False)
+                    if thinking_filter:
+                        content = thinking_filter.feed(content)
+                        if done:
+                            content += thinking_filter.flush()
+                    total_content += content
+                    chunk["model"] = cfg.proxy_model_name
+                    chunk["message"]["content"] = content
+                    if content or done:
+                        yield json.dumps(chunk) + "\n"
+            else:
+                async for chunk in _iter_openai_stream(response):
+                    if chunk is None:
+                        remaining = thinking_filter.flush() if thinking_filter else ""
+                        total_content += remaining
+                        yield json.dumps({
+                            "model": cfg.proxy_model_name,
+                            "message": {"role": "assistant", "content": remaining},
+                            "done": True,
+                            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+                        }) + "\n"
+                        break
 
-                choice = chunk.get("choices", [{}])[0]
-                delta = choice.get("delta", {})
-                content = delta.get("content", "") or ""
+                    choice = chunk.get("choices", [{}])[0]
+                    delta = choice.get("delta", {})
+                    content = delta.get("content", "") or ""
 
-                if is_reasoning and "reasoning_content" in delta:
-                    reasoning = delta["reasoning_content"]
-                    if reasoning:
-                        log_manager.log("thinking", f"Filtered reasoning_content ({len(reasoning)} chars)")
+                    if is_reasoning and "reasoning_content" in delta:
+                        reasoning = delta["reasoning_content"]
+                        if reasoning:
+                            log_manager.log("thinking", f"Filtered reasoning_content ({len(reasoning)} chars)")
 
-                if thinking_filter and content:
-                    content = thinking_filter.feed(content)
+                    if thinking_filter and content:
+                        content = thinking_filter.feed(content)
 
-                tool_calls = delta.get("tool_calls")
-                if tool_calls:
-                    yield json.dumps({
-                        "model": cfg.proxy_model_name,
-                        "message": {"role": "assistant", "content": "", "tool_calls": tool_calls},
-                        "done": False,
-                        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-                    }) + "\n"
+                    tool_calls = delta.get("tool_calls")
+                    if tool_calls:
+                        yield json.dumps({
+                            "model": cfg.proxy_model_name,
+                            "message": {"role": "assistant", "content": "", "tool_calls": tool_calls},
+                            "done": False,
+                            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+                        }) + "\n"
 
-                total_content += content
-                if content:
-                    yield json.dumps({
-                        "model": cfg.proxy_model_name,
-                        "message": {"role": "assistant", "content": content},
-                        "done": False,
-                        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-                    }) + "\n"
+                    total_content += content
+                    if content:
+                        yield json.dumps({
+                            "model": cfg.proxy_model_name,
+                            "message": {"role": "assistant", "content": content},
+                            "done": False,
+                            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+                        }) + "\n"
+
+    except httpx.ReadTimeout:
+        log_manager.log("error", f"Backend '{backend.name}' ReadTimeout after {cfg.timeout}s",
+                        {"url": target_url, "chars_received": len(total_content)})
+        yield json.dumps({"model": cfg.proxy_model_name,
+                          "message": {"role": "assistant", "content": f"[Proxy error: ReadTimeout after {cfg.timeout}s]"},
+                          "done": True}) + "\n"
+        return
+    except httpx.ConnectError as exc:
+        log_manager.log("error", f"Backend '{backend.name}' connection failed: {exc}", {"url": target_url})
+        yield json.dumps({"model": cfg.proxy_model_name,
+                          "message": {"role": "assistant", "content": "[Proxy error: connection failed]"},
+                          "done": True}) + "\n"
+        return
+    except httpx.RemoteProtocolError as exc:
+        log_manager.log("error", f"Backend '{backend.name}' protocol error: {exc}",
+                        {"url": target_url, "chars_received": len(total_content)})
+        yield json.dumps({"model": cfg.proxy_model_name,
+                          "message": {"role": "assistant", "content": "[Proxy error: protocol error]"},
+                          "done": True}) + "\n"
+        return
 
     log_manager.log("response", f"<- {backend.name} stream complete ({len(total_content)} chars output)")
 
@@ -751,77 +777,95 @@ async def stream_chat_openai_out(backend: BackendConfig, body: dict):
     log_manager.log("request", f"-> {backend.name} ({backend.type}) {target_url}",
                     {"backend": backend.name, "model": backend.model})
 
-    async with client.stream("POST", target_url, json=request_body,
-                             headers=_auth_headers(backend),
-                             timeout=httpx.Timeout(cfg.timeout, connect=5.0)) as response:
-        if response.status_code != 200:
-            error_body = await response.aread()
-            log_manager.log("error", f"Backend '{backend.name}' returned {response.status_code}",
-                            {"body": error_body.decode(errors="replace")})
-            if response.status_code in _RETRYABLE_STATUS:
-                balancer.mark_error(backend.id)
-                next_b = await _find_fallback_backend(exclude={backend.id})
-                if next_b:
-                    log_manager.log("info", f"Retrying with backend '{next_b.name}'")
-                    async for chunk in stream_chat_openai_out(next_b, body):
-                        yield chunk
-                    return
-            yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': f'[Proxy error: backend returned {response.status_code}]'}, 'finish_reason': 'stop'}]})}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+    try:
+        async with client.stream("POST", target_url, json=request_body,
+                                 headers=_auth_headers(backend),
+                                 timeout=httpx.Timeout(cfg.timeout, connect=5.0)) as response:
+            if response.status_code != 200:
+                error_body = await response.aread()
+                log_manager.log("error", f"Backend '{backend.name}' returned {response.status_code}",
+                                {"body": error_body.decode(errors="replace")})
+                if response.status_code in _RETRYABLE_STATUS:
+                    balancer.mark_error(backend.id)
+                    next_b = await _find_fallback_backend(exclude={backend.id})
+                    if next_b:
+                        log_manager.log("info", f"Retrying with backend '{next_b.name}'")
+                        async for chunk in stream_chat_openai_out(next_b, body):
+                            yield chunk
+                        return
+                yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': f'[Proxy error: backend returned {response.status_code}]'}, 'finish_reason': 'stop'}]})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
 
-        if backend.type == "ollama":
-            async for chunk in _iter_ollama_stream(response):
-                msg = chunk.get("message", {})
-                content = msg.get("content", "")
-                done = chunk.get("done", False)
-                if thinking_filter:
-                    content = thinking_filter.feed(content)
+            if backend.type == "ollama":
+                async for chunk in _iter_ollama_stream(response):
+                    msg = chunk.get("message", {})
+                    content = msg.get("content", "")
+                    done = chunk.get("done", False)
+                    if thinking_filter:
+                        content = thinking_filter.feed(content)
+                        if done:
+                            content += thinking_filter.flush()
+
+                    tool_calls = msg.get("tool_calls")
+                    if tool_calls:
+                        delta = {"tool_calls": tool_calls}
+                        if content:
+                            delta["content"] = content
+                        yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'model': cfg.proxy_model_name, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': None}]})}\n\n"
+                    elif content:
+                        yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'model': cfg.proxy_model_name, 'choices': [{'index': 0, 'delta': {'content': content}, 'finish_reason': None}]})}\n\n"
+
                     if done:
-                        content += thinking_filter.flush()
+                        yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'model': cfg.proxy_model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                        yield "data: [DONE]\n\n"
+                        break
+            else:
+                # OpenAI -> OpenAI passthrough with filtering
+                async for chunk in _iter_openai_stream(response):
+                    if chunk is None:
+                        remaining = thinking_filter.flush() if thinking_filter else ""
+                        if remaining:
+                            yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'model': cfg.proxy_model_name, 'choices': [{'index': 0, 'delta': {'content': remaining}, 'finish_reason': None}]})}\n\n"
+                        yield "data: [DONE]\n\n"
+                        break
 
-                tool_calls = msg.get("tool_calls")
-                if tool_calls:
-                    delta = {"tool_calls": tool_calls}
-                    if content:
+                    chunk["model"] = cfg.proxy_model_name
+                    choices = chunk.get("choices", [{}])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+
+                    if is_reasoning and "reasoning_content" in delta:
+                        reasoning = delta.pop("reasoning_content", None)
+                        if reasoning:
+                            log_manager.log("thinking", f"Filtered reasoning_content ({len(reasoning)} chars)")
+
+                    content = delta.get("content", "") or ""
+                    if thinking_filter and content:
+                        content = thinking_filter.feed(content)
                         delta["content"] = content
-                    yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'model': cfg.proxy_model_name, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': None}]})}\n\n"
-                elif content:
-                    yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'model': cfg.proxy_model_name, 'choices': [{'index': 0, 'delta': {'content': content}, 'finish_reason': None}]})}\n\n"
 
-                if done:
-                    yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'model': cfg.proxy_model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
-                    yield "data: [DONE]\n\n"
-                    break
-        else:
-            # OpenAI -> OpenAI passthrough with filtering
-            async for chunk in _iter_openai_stream(response):
-                if chunk is None:
-                    remaining = thinking_filter.flush() if thinking_filter else ""
-                    if remaining:
-                        yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'model': cfg.proxy_model_name, 'choices': [{'index': 0, 'delta': {'content': remaining}, 'finish_reason': None}]})}\n\n"
-                    yield "data: [DONE]\n\n"
-                    break
+                    has_tool_calls = "tool_calls" in delta
+                    if content or has_tool_calls or choices[0].get("finish_reason"):
+                        yield f"data: {json.dumps(chunk)}\n\n"
 
-                chunk["model"] = cfg.proxy_model_name
-                choices = chunk.get("choices", [{}])
-                if not choices:
-                    continue
-                delta = choices[0].get("delta", {})
-
-                if is_reasoning and "reasoning_content" in delta:
-                    reasoning = delta.pop("reasoning_content", None)
-                    if reasoning:
-                        log_manager.log("thinking", f"Filtered reasoning_content ({len(reasoning)} chars)")
-
-                content = delta.get("content", "") or ""
-                if thinking_filter and content:
-                    content = thinking_filter.feed(content)
-                    delta["content"] = content
-
-                has_tool_calls = "tool_calls" in delta
-                if content or has_tool_calls or choices[0].get("finish_reason"):
-                    yield f"data: {json.dumps(chunk)}\n\n"
+    except httpx.ReadTimeout:
+        log_manager.log("error", f"Backend '{backend.name}' ReadTimeout after {cfg.timeout}s",
+                        {"url": target_url})
+        yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': f'[Proxy error: ReadTimeout after {cfg.timeout}s]'}, 'finish_reason': 'stop'}]})}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+    except httpx.ConnectError as exc:
+        log_manager.log("error", f"Backend '{backend.name}' connection failed: {exc}", {"url": target_url})
+        yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': '[Proxy error: connection failed]'}, 'finish_reason': 'stop'}]})}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+    except httpx.RemoteProtocolError as exc:
+        log_manager.log("error", f"Backend '{backend.name}' protocol error: {exc}", {"url": target_url})
+        yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': '[Proxy error: protocol error]'}, 'finish_reason': 'stop'}]})}\n\n"
+        yield "data: [DONE]\n\n"
+        return
 
     log_manager.log("response", f"<- {backend.name} stream complete")
 
@@ -929,61 +973,75 @@ async def _stream_and_buffer(backend: BackendConfig, body: dict) -> tuple[str, l
     tool_calls_buf: list = []
     tool_calls_by_index: dict[int, dict] = {}
 
-    async with client.stream("POST", target_url, json=request_body,
-                             headers=_auth_headers(backend),
-                             timeout=httpx.Timeout(cfg.timeout, connect=5.0)) as response:
-        if response.status_code != 200:
-            error_body = await response.aread()
-            log_manager.log("error", f"Backend '{backend.name}' returned {response.status_code}",
-                            {"body": error_body.decode(errors="replace")})
-            if response.status_code in _RETRYABLE_STATUS:
-                raise BackendRetryableError(backend.name, response.status_code)
-            return f"[Backend error: {response.status_code}]", []
+    try:
+        async with client.stream("POST", target_url, json=request_body,
+                                 headers=_auth_headers(backend),
+                                 timeout=httpx.Timeout(cfg.timeout, connect=5.0)) as response:
+            if response.status_code != 200:
+                error_body = await response.aread()
+                log_manager.log("error", f"Backend '{backend.name}' returned {response.status_code}",
+                                {"body": error_body.decode(errors="replace")})
+                if response.status_code in _RETRYABLE_STATUS:
+                    raise BackendRetryableError(backend.name, response.status_code)
+                return f"[Backend error: {response.status_code}]", []
 
-        if backend.type == "ollama":
-            async for chunk in _iter_ollama_stream(response):
-                msg = chunk.get("message", {})
-                content = msg.get("content", "")
-                if thinking_filter:
-                    content = thinking_filter.feed(content)
-                    if chunk.get("done"):
-                        content += thinking_filter.flush()
-                content_buf += content
-                if msg.get("tool_calls"):
-                    tool_calls_buf.extend(msg["tool_calls"])
-        else:
-            async for chunk in _iter_openai_stream(response):
-                if chunk is None:
+            if backend.type == "ollama":
+                async for chunk in _iter_ollama_stream(response):
+                    msg = chunk.get("message", {})
+                    content = msg.get("content", "")
                     if thinking_filter:
-                        content_buf += thinking_filter.flush()
-                    break
-                choices = chunk.get("choices", [])
-                if not choices:
-                    continue
-                delta = choices[0].get("delta", {})
-                content = delta.get("content", "") or ""
-                if is_reasoning and "reasoning_content" in delta:
-                    delta.pop("reasoning_content", None)
-                if thinking_filter and content:
-                    content = thinking_filter.feed(content)
-                content_buf += content
+                        content = thinking_filter.feed(content)
+                        if chunk.get("done"):
+                            content += thinking_filter.flush()
+                    content_buf += content
+                    if msg.get("tool_calls"):
+                        tool_calls_buf.extend(msg["tool_calls"])
+            else:
+                async for chunk in _iter_openai_stream(response):
+                    if chunk is None:
+                        if thinking_filter:
+                            content_buf += thinking_filter.flush()
+                        break
+                    choices = chunk.get("choices", [])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content", "") or ""
+                    if is_reasoning and "reasoning_content" in delta:
+                        delta.pop("reasoning_content", None)
+                    if thinking_filter and content:
+                        content = thinking_filter.feed(content)
+                    content_buf += content
 
-                # Assemble tool_calls from incremental SSE deltas
-                for tc in delta.get("tool_calls", []):
-                    idx = tc.get("index", 0)
-                    if idx not in tool_calls_by_index:
-                        tool_calls_by_index[idx] = {
-                            "id": tc.get("id", ""), "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        }
-                    entry = tool_calls_by_index[idx]
-                    fn = tc.get("function", {})
-                    if fn.get("name"):
-                        entry["function"]["name"] = fn["name"]
-                    if fn.get("arguments"):
-                        entry["function"]["arguments"] += fn["arguments"]
-                    if tc.get("id"):
-                        entry["id"] = tc["id"]
+                    # Assemble tool_calls from incremental SSE deltas
+                    for tc in delta.get("tool_calls", []):
+                        idx = tc.get("index", 0)
+                        if idx not in tool_calls_by_index:
+                            tool_calls_by_index[idx] = {
+                                "id": tc.get("id", ""), "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        entry = tool_calls_by_index[idx]
+                        fn = tc.get("function", {})
+                        if fn.get("name"):
+                            entry["function"]["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            entry["function"]["arguments"] += fn["arguments"]
+                        if tc.get("id"):
+                            entry["id"] = tc["id"]
+
+    except httpx.ReadTimeout:
+        log_manager.log("error", f"Backend '{backend.name}' ReadTimeout after {cfg.timeout}s",
+                        {"url": target_url, "chars_received": len(content_buf)})
+        raise BackendRetryableError(backend.name, 504)
+    except httpx.ConnectError as exc:
+        log_manager.log("error", f"Backend '{backend.name}' connection failed: {exc}",
+                        {"url": target_url})
+        raise BackendRetryableError(backend.name, 503)
+    except httpx.RemoteProtocolError as exc:
+        log_manager.log("error", f"Backend '{backend.name}' protocol error: {exc}",
+                        {"url": target_url, "chars_received": len(content_buf)})
+        raise BackendRetryableError(backend.name, 502)
 
     if tool_calls_by_index:
         tool_calls_buf = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
